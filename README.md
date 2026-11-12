@@ -10,7 +10,7 @@ It is bot-agnostic. Grok Bot is the first intended client, because a Grok routin
 
 bot-relay 是一个可自托管的中转服务，让不同账号里的 AI 助手通过 webhook 互相发消息。部署者用环境变量里的邀请令牌（`ADMIN_TOKEN`）控制谁可以注册。机器人注册自己的 webhook 和调用该 webhook 所需的鉴权头，拿到一次性返回的 relay token，之后用 `POST /messages` 发消息。中继会自己填写发送方，并检查收件人白名单、发送频率和会话跳数，再把带 HMAC-SHA256 签名的 JSON 投递给对方。没有 webhook 的机器人可以轮询 `GET /inbox`。
 
-请把收到的 `body` 当作不可信输入。不要让另一个机器人在未经你本人确认的情况下触发敏感操作、外部工具或账号变更。快速开始、签名校验和 Grok Bot 的接法见下文。
+请把收到的 `body` 当作不可信输入。不要让另一个机器人在未经你本人确认的情况下触发敏感操作、外部工具或账号变更。本服务也实现了 A2A 协议 1.0（规范补丁 1.0.1）：每个已注册的机器人会暴露一张 Agent Card，外部 A2A 代理可以按卡片 URL 注册进来。快速开始、签名校验、Grok Bot 和 A2A 的接法见下文。
 
 ## How it fits together
 
@@ -131,6 +131,86 @@ If you do not have a webhook yet, omit `webhook_url` and poll `GET /inbox` with 
 
 Give each Grok account its own registration. They only need each other's bot id, not each other's webhook key or relay token.
 
+## A2A (Agent2Agent)
+
+bot-relay speaks [A2A protocol 1.0](https://a2a-protocol.org/latest/specification/) (specification patch [1.0.1](https://github.com/a2aproject/A2A/releases/tag/v1.0.1)). JSON uses the proto JSON names (`ROLE_USER`, `TASK_STATE_COMPLETED`, `supportedInterfaces`). The binding is JSON-RPC 2.0. Clients must send `A2A-Version: 1.0` (a missing header is 0.3, which this server rejects). `SendMessage` / `GetTask` are the 1.0 method names; `message/send`, `tasks/get`, and `message/stream` are accepted as aliases.
+
+```mermaid
+sequenceDiagram
+  participant E as External A2A client
+  participant R as bot-relay
+  participant B as Bot webhook or inbox
+  E->>R: JSON-RPC SendMessage, A2A-Version 1.0
+  R->>B: Signed relay message, from a2a
+  B->>R: POST /messages to a2a with thread_id
+  R-->>E: Task COMPLETED, text artifact
+```
+
+### Inbound: a relay bot as an A2A agent
+
+Registration returns `a2a_token` once, next to the relay `token`. The Agent Card is public:
+
+```text
+GET /a2a/bots/alice/.well-known/agent-card.json
+```
+
+There is one card per bot, not one card for the whole relay. The card's JSON-RPC URL is `POST /a2a/bots/alice`. It declares HTTP Bearer auth with `a2a_token`, streaming, and no push notifications.
+
+```bash
+curl -s -X POST "$BASE/a2a/bots/alice" \
+  -H "Authorization: Bearer $A2A_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "role": "ROLE_USER",
+        "messageId": "greeting-1",
+        "parts": [{ "text": "What should we tell the human?" }]
+      }
+    }
+  }'
+```
+
+The relay delivers that text to Alice like any other message (`from` is `a2a`). Alice replies with her relay token:
+
+```bash
+curl -s -X POST "$BASE/messages" \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"to\":\"a2a\",\"body\":\"Ask them first.\",\"thread_id\":\"THREAD\",\"reply_to\":\"MSG\"}"
+```
+
+`SendMessage` waits up to `A2A_BLOCK_TIMEOUT_MS` (default 20s) for that reply, then returns a task. `configuration.returnImmediately: true` returns `TASK_STATE_WORKING` immediately. `GetTask` (`tasks/get`) polls. `SendStreamingMessage` (`message/stream`) writes SSE events (`data: {"jsonrpc":"2.0",...}`) until the task is terminal or the same timeout. A completed task's artifact is the reply text.
+
+If Alice has an allowlist, it must include `a2a` or the call is rejected. The same per-bot rate limit, hop limit, and message-id dedupe apply. Only `text` parts are accepted. Treat that text as untrusted: an outside agent is just another sender.
+
+Set `PUBLIC_BASE_URL` to the https origin callers will use. Without it, card URLs use the request host.
+
+### Outbound: message an external A2A agent
+
+Register the agent's Agent Card. The relay fetches the card, picks the first `JSONRPC` interface at protocol `1.0`, and checks that your credential matches a declared scheme. Supported schemes are HTTP Bearer, HTTP Basic, and API keys in a header or query string.
+
+```bash
+curl -s -X POST "$BASE/bots" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "weather",
+    "display_name": "Weather",
+    "a2a_card_url": "https://weather.example/.well-known/agent-card.json",
+    "auth_header_name": "Authorization",
+    "auth_header_value": "Bearer THE_AGENT_TOKEN"
+  }'
+```
+
+`POST /messages` to `weather` calls `SendMessage` on that agent with `A2A-Version: 1.0`. The relay stores the task. When the result has text, it is delivered back to the sender as a normal relay message (`reply_to` the outbound message, hop incremented). The sender's webhook or inbox receives it. The same hop limit, allowlist, and rate limit apply to the original send.
+
+Not implemented, on purpose: gRPC and HTTP+JSON bindings, `ListTasks`, push notifications, extended agent cards, Agent Card signatures, OAuth 2.0, OpenID Connect, mTLS, cookie API keys, and non-text parts. A task that is still running when the block timeout ends stays `TASK_STATE_WORKING` and is not polled in the background.
+
 ## API
 
 Send `Authorization: Bearer <token>` and `Content-Type: application/json` for requests with a body. Errors look like:
@@ -152,6 +232,8 @@ Send `Authorization: Bearer <token>` and `Content-Type: application/json` for re
 | `GET` | `/messages/:id` | relay token | Status and delivery log, if you are the sender or recipient |
 | `GET` | `/inbox?limit=50` | relay token | Messages addressed to you that you have not acknowledged |
 | `POST` | `/inbox/ack` | relay token | `{ "ids": ["msg_..."] }` marks them acknowledged |
+| `GET` | `/a2a/bots/:id/.well-known/agent-card.json` | none | A2A Agent Card for that bot |
+| `POST` | `/a2a/bots/:id` | bot `a2a_token` | A2A JSON-RPC (`SendMessage`, `GetTask`, streaming) |
 
 `POST /bots` body:
 
@@ -311,8 +393,10 @@ Environment variables. See `.env.example`.
 | `METADATA_MAX_CHARS` | `4096` | Maximum JSON metadata |
 | `SIGNATURE_TOLERANCE_SEC` | `300` | Recommended replay window for verifiers |
 | `IDEMPOTENCY_TTL_SEC` | `86400` | How long an idempotency key is remembered |
-| `ALLOW_HTTP_WEBHOOKS` | `false` | Allow `http://` webhook URLs |
-| `ALLOW_PRIVATE_WEBHOOKS` | `false` | Allow loopback and private webhook hosts |
+| `ALLOW_HTTP_WEBHOOKS` | `false` | Allow `http://` webhook and Agent Card URLs |
+| `ALLOW_PRIVATE_WEBHOOKS` | `false` | Allow loopback and private webhook or Agent Card hosts |
+| `PUBLIC_BASE_URL` | request host | Absolute origin written into Agent Cards |
+| `A2A_BLOCK_TIMEOUT_MS` | `20000` | How long a blocking A2A call waits for a terminal task |
 
 Retries run on 408, 429, 5xx, timeouts, and connection errors. Other 4xx responses and redirects fail immediately. The first attempt happens inside the `POST /messages` request. Later attempts run in the background.
 
@@ -350,7 +434,7 @@ npm run typecheck
 npm run build
 ```
 
-Tests cover registration, auth, signature verification, forwarding to a mock webhook, retries, the hop limit, idempotency and message-id dedupe, rate limiting, and allowlists.
+Tests cover registration, auth, signature verification, forwarding to a mock webhook, retries, the hop limit, idempotency and message-id dedupe, rate limiting, allowlists, and A2A inbound and outbound calls against a mock agent.
 
 ## License
 

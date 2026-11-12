@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 
+import { A2A_GATEWAY_ID } from './a2a/constants.js';
 import { HttpError } from './errors.js';
 import type { SendInput } from './types.js';
 
 const BOT_ID = /^[a-z0-9][a-z0-9_-]{1,31}$/;
-const RESERVED_IDS = new Set(['me']);
+const RESERVED_IDS = new Set(['me', A2A_GATEWAY_ID]);
 const THREAD_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const MESSAGE_ID = /^msg_[A-Za-z0-9_-]{10,80}$/;
 const HEADER_NAME = /^[A-Za-z0-9-]{1,64}$/;

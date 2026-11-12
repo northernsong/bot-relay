@@ -36,6 +36,8 @@ export function makeApp(overrides: Partial<Config> = {}): { app: Hono; deps: Dep
     idempotencyTtlSec: 86_400,
     allowHttpWebhooks: true,
     allowPrivateWebhooks: true,
+    publicBaseUrl: null,
+    a2aBlockTimeoutMs: 20_000,
     ...overrides,
     databasePath: ':memory:',
   };

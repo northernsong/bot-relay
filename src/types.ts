@@ -1,3 +1,5 @@
+export type BotKind = 'relay' | 'a2a';
+
 export type Bot = {
   id: string;
   displayName: string;
@@ -7,6 +9,14 @@ export type Bot = {
   tokenHash: string;
   /** null means any registered bot may send. An empty array means nobody may send. */
   allowlist: string[] | null;
+  kind: BotKind;
+  a2aCardUrl: string | null;
+  a2aEndpoint: string | null;
+  a2aInboundTokenHash: string | null;
+  acceptA2a: boolean;
+  /** Where the stored outbound credential is attached. */
+  a2aAuthIn: 'header' | 'query' | null;
+  a2aTenant: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -73,6 +83,13 @@ export type NewBot = {
   authHeaderValueEnc: string | null;
   tokenHash: string;
   allowlist: string[] | null;
+  kind: BotKind;
+  a2aCardUrl: string | null;
+  a2aEndpoint: string | null;
+  a2aInboundTokenHash: string | null;
+  acceptA2a: boolean;
+  a2aAuthIn: 'header' | 'query' | null;
+  a2aTenant: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -84,4 +101,39 @@ export type BotPatch = {
   authHeaderValueEnc?: string | null;
   allowlist?: string[] | null;
   tokenHash?: string;
+  acceptA2a?: boolean;
+  a2aInboundTokenHash?: string | null;
+};
+
+export type A2aDirection = 'inbound' | 'outbound';
+
+export type A2aTask = {
+  id: string;
+  direction: A2aDirection;
+  botId: string;
+  contextId: string | null;
+  threadId: string;
+  relayMessageId: string | null;
+  state: string;
+  remoteMessageId: string | null;
+  requestText: string;
+  responseText: string | null;
+  history: unknown[];
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type NewA2aTask = {
+  id: string;
+  direction: A2aDirection;
+  botId: string;
+  contextId: string | null;
+  threadId: string;
+  relayMessageId: string | null;
+  state: string;
+  remoteMessageId: string | null;
+  requestText: string;
+  responseText: string | null;
+  history: unknown[];
+  createdAt: number;
 };

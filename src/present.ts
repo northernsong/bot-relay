@@ -1,16 +1,21 @@
 import type { Bot, DeliveryAttempt, Message } from './types.js';
 
-export function presentOwnBot(bot: Bot, token?: string): Record<string, unknown> {
+export function presentOwnBot(bot: Bot, token?: string, a2aToken?: string): Record<string, unknown> {
   return {
     id: bot.id,
     display_name: bot.displayName,
+    kind: bot.kind,
     webhook_url: bot.webhookUrl,
     auth_header_name: bot.authHeaderName,
     has_auth_header: bot.authHeaderValueEnc !== null,
     allowlist: bot.allowlist,
+    accept_a2a: bot.acceptA2a,
+    a2a_card_url: bot.a2aCardUrl,
+    a2a_endpoint: bot.a2aEndpoint,
     created_at: iso(bot.createdAt),
     updated_at: iso(bot.updatedAt),
     ...(token ? { token } : {}),
+    ...(a2aToken ? { a2a_token: a2aToken } : {}),
   };
 }
 
@@ -18,7 +23,7 @@ export function presentPublicBot(bot: Bot): Record<string, unknown> {
   return {
     id: bot.id,
     display_name: bot.displayName,
-    delivery: bot.webhookUrl ? 'webhook' : 'inbox',
+    delivery: bot.kind === 'a2a' ? 'a2a' : bot.webhookUrl ? 'webhook' : 'inbox',
   };
 }
 

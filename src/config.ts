@@ -17,6 +17,10 @@ export type Config = {
   idempotencyTtlSec: number;
   allowHttpWebhooks: boolean;
   allowPrivateWebhooks: boolean;
+  /** Origin used in Agent Card URLs. Request host is used when this is unset. */
+  publicBaseUrl: string | null;
+  /** How long a blocking A2A call waits for a bot reply or a remote terminal task. */
+  a2aBlockTimeoutMs: number;
 };
 
 type Env = Record<string, string | undefined>;
@@ -41,7 +45,25 @@ export function loadConfig(env: Env = process.env): Config {
     idempotencyTtlSec: intEnv(env, 'IDEMPOTENCY_TTL_SEC', 86_400, 60, 30 * 86_400),
     allowHttpWebhooks: boolEnv(env, 'ALLOW_HTTP_WEBHOOKS', false),
     allowPrivateWebhooks: boolEnv(env, 'ALLOW_PRIVATE_WEBHOOKS', false),
+    publicBaseUrl: optionalBaseUrl(env, 'PUBLIC_BASE_URL'),
+    a2aBlockTimeoutMs: intEnv(env, 'A2A_BLOCK_TIMEOUT_MS', 20_000, 0, 120_000),
   };
+}
+
+function optionalBaseUrl(env: Env, name: string): string | null {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') return null;
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(`${name} must be an absolute http(s) URL`);
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error(`${name} must be an absolute http(s) URL`);
+  }
+  const path = url.pathname.replace(/\/$/, '');
+  return `${url.origin}${path}`;
 }
 
 function secretEnv(env: Env, name: string, min: number): string {

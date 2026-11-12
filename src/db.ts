@@ -1,14 +1,19 @@
+import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { A2A_GATEWAY_ID, TERMINAL_STATES } from './a2a/constants.js';
+import { hashToken } from './secret.js';
 import type {
+  A2aTask,
   Bot,
   BotPatch,
   DeliveryAttempt,
   IdempotencyRecord,
   Message,
   MessageStatus,
+  NewA2aTask,
   NewBot,
   NewMessage,
 } from './types.js';
@@ -74,6 +79,25 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_attempts_message ON delivery_attempts(message_id, attempt);
+
+CREATE TABLE IF NOT EXISTS a2a_tasks (
+  id TEXT PRIMARY KEY,
+  direction TEXT NOT NULL,
+  bot_id TEXT NOT NULL,
+  context_id TEXT,
+  thread_id TEXT NOT NULL,
+  relay_message_id TEXT,
+  state TEXT NOT NULL,
+  remote_message_id TEXT,
+  request_text TEXT NOT NULL,
+  response_text TEXT,
+  history_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_a2a_thread ON a2a_tasks(direction, bot_id, thread_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_a2a_remote ON a2a_tasks(direction, bot_id, remote_message_id);
 `;
 
 type RawBot = {
@@ -84,6 +108,29 @@ type RawBot = {
   auth_header_value_enc: string | null;
   token_hash: string;
   allowlist: string | null;
+  kind: string | null;
+  a2a_card_url: string | null;
+  a2a_endpoint: string | null;
+  a2a_inbound_token_hash: string | null;
+  accept_a2a: number | null;
+  a2a_auth_in: string | null;
+  a2a_tenant: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type RawA2aTask = {
+  id: string;
+  direction: string;
+  bot_id: string;
+  context_id: string | null;
+  thread_id: string;
+  relay_message_id: string | null;
+  state: string;
+  remote_message_id: string | null;
+  request_text: string;
+  response_text: string | null;
+  history_json: string;
   created_at: number;
   updated_at: number;
 };
@@ -144,8 +191,9 @@ export class RelayDb {
       .prepare(
         `INSERT INTO bots (
           id, display_name, webhook_url, auth_header_name, auth_header_value_enc,
-          token_hash, allowlist, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          token_hash, allowlist, created_at, updated_at, kind, a2a_card_url, a2a_endpoint,
+          a2a_inbound_token_hash, accept_a2a, a2a_auth_in, a2a_tenant
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         bot.id,
@@ -157,6 +205,13 @@ export class RelayDb {
         encodeAllowlist(bot.allowlist),
         bot.createdAt,
         bot.updatedAt,
+        bot.kind,
+        bot.a2aCardUrl,
+        bot.a2aEndpoint,
+        bot.a2aInboundTokenHash,
+        bot.acceptA2a ? 1 : 0,
+        bot.a2aAuthIn,
+        bot.a2aTenant,
       );
   }
 
@@ -192,6 +247,14 @@ export class RelayDb {
     if (Object.prototype.hasOwnProperty.call(patch, 'allowlist')) {
       sets.push('allowlist = ?');
       values.push(encodeAllowlist(patch.allowlist ?? null));
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'acceptA2a')) {
+      sets.push('accept_a2a = ?');
+      values.push(patch.acceptA2a ? 1 : 0);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'a2aInboundTokenHash')) {
+      sets.push('a2a_inbound_token_hash = ?');
+      values.push(patch.a2aInboundTokenHash ?? null);
     }
     sets.push('updated_at = ?');
     values.push(now);
@@ -375,6 +438,129 @@ export class RelayDb {
     return rows.map((row) => row.id);
   }
 
+  insertA2aTask(task: NewA2aTask): void {
+    this.sqlite
+      .prepare(
+        `INSERT INTO a2a_tasks (
+          id, direction, bot_id, context_id, thread_id, relay_message_id, state,
+          remote_message_id, request_text, response_text, history_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        task.id,
+        task.direction,
+        task.botId,
+        task.contextId,
+        task.threadId,
+        task.relayMessageId,
+        task.state,
+        task.remoteMessageId,
+        task.requestText,
+        task.responseText,
+        JSON.stringify(task.history),
+        task.createdAt,
+        task.createdAt,
+      );
+  }
+
+  getA2aTask(id: string): A2aTask | undefined {
+    const row = this.sqlite.prepare('SELECT * FROM a2a_tasks WHERE id = ?').get(id) as RawA2aTask | undefined;
+    return row ? mapA2aTask(row) : undefined;
+  }
+
+  getA2aTaskByRemote(botId: string, direction: string, remoteMessageId: string): A2aTask | undefined {
+    const row = this.sqlite
+      .prepare(
+        'SELECT * FROM a2a_tasks WHERE direction = ? AND bot_id = ? AND remote_message_id = ?',
+      )
+      .get(direction, botId, remoteMessageId) as RawA2aTask | undefined;
+    return row ? mapA2aTask(row) : undefined;
+  }
+
+  hasInboundTask(botId: string, threadId: string): boolean {
+    const row = this.sqlite
+      .prepare(
+        `SELECT 1 AS ok FROM a2a_tasks
+         WHERE direction = 'inbound' AND bot_id = ? AND thread_id = ?
+         LIMIT 1`,
+      )
+      .get(botId, threadId) as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
+  activeInboundTask(botId: string, threadId: string): A2aTask | undefined {
+    const row = this.sqlite
+      .prepare(
+        `SELECT * FROM a2a_tasks
+         WHERE direction = 'inbound' AND bot_id = ? AND thread_id = ?
+           AND state NOT IN ('TASK_STATE_COMPLETED', 'TASK_STATE_FAILED', 'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED')
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get(botId, threadId) as RawA2aTask | undefined;
+    return row ? mapA2aTask(row) : undefined;
+  }
+
+  latestOutboundTask(botId: string, threadId: string): A2aTask | undefined {
+    const row = this.sqlite
+      .prepare(
+        `SELECT * FROM a2a_tasks
+         WHERE direction = 'outbound' AND bot_id = ? AND thread_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get(botId, threadId) as RawA2aTask | undefined;
+    return row ? mapA2aTask(row) : undefined;
+  }
+
+  linkA2aRelayMessage(id: string, relayMessageId: string, now: number): void {
+    this.sqlite
+      .prepare(
+        `UPDATE a2a_tasks
+         SET relay_message_id = ?,
+             state = CASE WHEN state = 'TASK_STATE_SUBMITTED' THEN 'TASK_STATE_WORKING' ELSE state END,
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(relayMessageId, now, id);
+  }
+
+  completeA2aTask(id: string, responseText: string, history: unknown[], now: number): void {
+    const terminal = [...TERMINAL_STATES];
+    this.sqlite
+      .prepare(
+        `UPDATE a2a_tasks
+         SET state = 'TASK_STATE_COMPLETED', response_text = ?, history_json = ?, updated_at = ?
+         WHERE id = ? AND state NOT IN (${terminal.map(() => '?').join(', ')})`,
+      )
+      .run(responseText, JSON.stringify(history), now, id, ...terminal);
+  }
+
+  setA2aState(id: string, state: string, now: number): void {
+    this.sqlite.prepare('UPDATE a2a_tasks SET state = ?, updated_at = ? WHERE id = ?').run(state, now, id);
+  }
+
+  mergeMessageMetadata(id: string, extra: Record<string, unknown>): void {
+    const message = this.getMessage(id);
+    const base =
+      message?.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
+        ? (message.metadata as Record<string, unknown>)
+        : {};
+    this.sqlite
+      .prepare('UPDATE messages SET metadata = ? WHERE id = ?')
+      .run(JSON.stringify({ ...base, ...extra }), id);
+  }
+
+  finishMessage(id: string, status: 'delivered' | 'failed' | 'inbox', lastError: string | null, deliveredAt: number | null): void {
+    this.sqlite
+      .prepare(
+        `UPDATE messages
+         SET status = ?, last_error = ?, delivered_at = ?, next_attempt_at = NULL
+         WHERE id = ?`,
+      )
+      .run(status, lastError, deliveredAt, id);
+  }
+
   private requeueInFlight(now: number): void {
     // A crash mid-delivery leaves the row in `delivering`. Put it back so it is tried again.
     // Recipients must dedupe on message id because this can deliver a message twice.
@@ -391,7 +577,42 @@ export function openDatabase(path: string): RelayDb {
   sqlite.exec('PRAGMA busy_timeout = 3000');
   if (path !== ':memory:') sqlite.exec('PRAGMA journal_mode = WAL');
   sqlite.exec(MIGRATION);
+  ensureBotColumns(sqlite);
+  ensureSystemBot(sqlite);
   return new RelayDb(sqlite);
+}
+
+function ensureBotColumns(sqlite: DatabaseSync): void {
+  const present = new Set(
+    (sqlite.prepare('PRAGMA table_info(bots)').all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  const add: Array<[string, string]> = [
+    ['kind', `TEXT NOT NULL DEFAULT 'relay'`],
+    ['a2a_card_url', 'TEXT'],
+    ['a2a_endpoint', 'TEXT'],
+    ['a2a_inbound_token_hash', 'TEXT'],
+    ['accept_a2a', 'INTEGER NOT NULL DEFAULT 1'],
+    ['a2a_auth_in', 'TEXT'],
+    ['a2a_tenant', 'TEXT'],
+  ];
+  for (const [name, ddl] of add) {
+    if (!present.has(name)) sqlite.exec(`ALTER TABLE bots ADD COLUMN ${name} ${ddl}`);
+  }
+}
+
+function ensureSystemBot(sqlite: DatabaseSync): void {
+  const existing = sqlite.prepare('SELECT id FROM bots WHERE id = ?').get(A2A_GATEWAY_ID) as { id: string } | undefined;
+  if (existing) return;
+  const now = Date.now();
+  sqlite
+    .prepare(
+      `INSERT INTO bots (
+        id, display_name, webhook_url, auth_header_name, auth_header_value_enc,
+        token_hash, allowlist, created_at, updated_at, kind, a2a_card_url, a2a_endpoint,
+        a2a_inbound_token_hash, accept_a2a, a2a_auth_in, a2a_tenant
+      ) VALUES (?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, 'relay', NULL, NULL, NULL, 0, NULL, NULL)`,
+    )
+    .run(A2A_GATEWAY_ID, 'A2A', hashToken(randomBytes(32).toString('hex')), now, now);
 }
 
 function mapBot(row: RawBot): Bot {
@@ -403,6 +624,38 @@ function mapBot(row: RawBot): Bot {
     authHeaderValueEnc: row.auth_header_value_enc,
     tokenHash: row.token_hash,
     allowlist: decodeAllowlist(row.allowlist),
+    kind: row.kind === 'a2a' ? 'a2a' : 'relay',
+    a2aCardUrl: row.a2a_card_url,
+    a2aEndpoint: row.a2a_endpoint,
+    a2aInboundTokenHash: row.a2a_inbound_token_hash,
+    acceptA2a: row.accept_a2a !== 0,
+    a2aAuthIn: row.a2a_auth_in === 'query' ? 'query' : row.a2a_auth_in === 'header' ? 'header' : null,
+    a2aTenant: row.a2a_tenant,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
+}
+
+function mapA2aTask(row: RawA2aTask): A2aTask {
+  let history: unknown[] = [];
+  try {
+    const parsed = JSON.parse(row.history_json) as unknown;
+    if (Array.isArray(parsed)) history = parsed;
+  } catch {
+    history = [];
+  }
+  return {
+    id: row.id,
+    direction: row.direction === 'outbound' ? 'outbound' : 'inbound',
+    botId: row.bot_id,
+    contextId: row.context_id,
+    threadId: row.thread_id,
+    relayMessageId: row.relay_message_id,
+    state: row.state,
+    remoteMessageId: row.remote_message_id,
+    requestText: row.request_text,
+    responseText: row.response_text,
+    history,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };

@@ -1,3 +1,6 @@
+import { completeInboundFromReply } from './a2a/bridge.js';
+import { A2A_GATEWAY_ID } from './a2a/constants.js';
+import { deliverToA2aAgent } from './a2a/outbound.js';
 import type { Deps } from './deps.js';
 import { attemptDelivery } from './delivery.js';
 import { HttpError, isUniqueConstraint } from './errors.js';
@@ -5,11 +8,14 @@ import { newMessageId, newThreadId } from './ids.js';
 import type { Bot, Message, SendInput } from './types.js';
 import { requestHash } from './validate.js';
 
+export type SendOptions = { skipRateLimit?: boolean };
+
 export async function sendMessage(
   deps: Deps,
   sender: Bot,
   input: SendInput,
   idemKey: string | null,
+  options: SendOptions = {},
 ): Promise<{ message: Message; replayed: boolean }> {
   const hash = requestHash(input);
   deps.db.pruneIdempotency(deps.now() - deps.config.idempotencyTtlSec * 1000);
@@ -19,20 +25,22 @@ export async function sendMessage(
     if (existing) return replayOrConflict(deps, existing.messageId, existing.requestHash, hash);
   }
 
-  const rate = deps.db.consumeRate(
-    sender.id,
-    deps.now(),
-    deps.config.rateLimitWindowSec * 1000,
-    deps.config.rateLimitMax,
-  );
-  if (!rate.allowed) {
-    throw new HttpError(
-      429,
-      'rate_limited',
-      `Too many messages. Limit is ${deps.config.rateLimitMax} per ${deps.config.rateLimitWindowSec}s.`,
-      { 'retry-after': String(rate.retryAfterSec) },
-      { retry_after: rate.retryAfterSec },
+  if (!options.skipRateLimit) {
+    const rate = deps.db.consumeRate(
+      sender.id,
+      deps.now(),
+      deps.config.rateLimitWindowSec * 1000,
+      deps.config.rateLimitMax,
     );
+    if (!rate.allowed) {
+      throw new HttpError(
+        429,
+        'rate_limited',
+        `Too many messages. Limit is ${deps.config.rateLimitMax} per ${deps.config.rateLimitWindowSec}s.`,
+        { 'retry-after': String(rate.retryAfterSec) },
+        { retry_after: rate.retryAfterSec },
+      );
+    }
   }
 
   let messageId = '';
@@ -60,12 +68,15 @@ export async function sendMessage(
       }
 
       const thread = resolveThread(deps, sender.id, input);
+      if (recipient.id === A2A_GATEWAY_ID && !deps.db.hasInboundTask(sender.id, thread.threadId)) {
+        throw new HttpError(403, 'not_allowed', 'Replies to a2a must stay on the A2A task thread');
+      }
       if (thread.hop > deps.config.maxHops) {
         throw new HttpError(409, 'hop_limit', `This thread has reached the hop limit of ${deps.config.maxHops}`);
       }
 
       messageId = newMessageId();
-      const hasWebhook = Boolean(recipient.webhookUrl);
+      const mode = recipient.kind === 'a2a' ? 'a2a' : recipient.webhookUrl ? 'webhook' : 'inbox';
       deps.db.insertMessage({
         id: messageId,
         fromId: sender.id,
@@ -75,8 +86,8 @@ export async function sendMessage(
         body: input.body,
         metadata: input.metadata,
         hop: thread.hop,
-        status: hasWebhook ? 'pending' : 'inbox',
-        nextAttemptAt: hasWebhook ? deps.now() : null,
+        status: mode === 'inbox' ? 'inbox' : 'pending',
+        nextAttemptAt: mode === 'webhook' ? deps.now() : null,
         createdAt: deps.now(),
       });
       if (idemKey) {
@@ -100,9 +111,12 @@ export async function sendMessage(
   let message = deps.db.getMessage(messageId);
   if (!message) throw new HttpError(500, 'internal', 'Message disappeared after insert');
   if (!replayed && message.status === 'pending') {
-    await attemptDelivery(deps, message.id);
+    const recipient = deps.db.getBot(message.toId);
+    if (recipient?.kind === 'a2a') await deliverToA2aAgent(deps, message);
+    else await attemptDelivery(deps, message.id);
     message = deps.db.getMessage(message.id) ?? message;
   }
+  if (!replayed) completeInboundFromReply(deps, message);
   return { message, replayed };
 }
 
