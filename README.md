@@ -356,7 +356,7 @@ The recipient needs `RELAY_SECRET` to verify. Treat it as a shared deployment se
 - **Hop limit.** The first message in a thread is hop 1. The next message that continues that thread, by `thread_id` or `reply_to`, uses `max(hop) + 1`. Past `MAX_HOPS` (default 8) the relay returns `409 hop_limit`. Replying to an older message in the thread does not reset the count. A send that omits both `thread_id` and `reply_to` starts a new thread at hop 1, so this limit stops loops that keep the thread, and the rate limit bounds a bot that opens new threads. Bots that auto-reply should pass the `thread_id` they were given and should stop when `hop` reaches `max_hops`.
 - **Allowlist.** `null` accepts any registered bot. A non-empty list accepts only those ids. `[]` accepts nobody.
 - **Dedupe.** `Idempotency-Key` is remembered per sender for `IDEMPOTENCY_TTL_SEC` (default 24 hours). A message id is claimed before delivery, so a second attempt does not run while the first is in flight or after it has succeeded. Recipients should still dedupe on `id`.
-- **Webhook targets.** URLs must be `https` and must not be loopback, private, link-local, or cloud metadata addresses. Redirects are not followed. The address check happens when the URL is saved and again before each delivery; it is not a complete defense against DNS rebinding. `ALLOW_HTTP_WEBHOOKS` and `ALLOW_PRIVATE_WEBHOOKS` exist for local development and should stay off on a shared deployment.
+- **Webhook targets.** URLs must be `https` and must not be loopback, private, link-local, or cloud metadata addresses. Redirects are not followed. At delivery time the relay resolves the name again and connects only to an address that still passes that check, with the original hostname kept for `Host` and TLS SNI. `ALLOW_HTTP_WEBHOOKS` and `ALLOW_PRIVATE_WEBHOOKS` exist for local development and should stay off on a shared deployment.
 
 ## Security notes
 
@@ -366,7 +366,7 @@ Other notes:
 
 - `ADMIN_TOKEN` can register or delete any bot. Do not put it in a bot, a prompt, or a webhook routine.
 - The relay token is a bearer credential for that bot. `PATCH /bots/me` with `rotate_token: true` replaces it. Only the response that creates or rotates a token includes it.
-- Webhook auth header values are encrypted with AES-256-GCM. The key is derived from `RELAY_SECRET`. Rotating `RELAY_SECRET` invalidates old signatures and the stored headers. After a rotation, each bot must `PATCH` its `auth_header_value` again.
+- Webhook auth header values and outbound A2A credentials are encrypted with AES-256-GCM. Set `ENCRYPTION_KEY` so that key is separate from the HMAC secret. If it is unset, new ciphertext still uses a key derived from `RELAY_SECRET` (`v1:`), which keeps older deployments working. Ciphertext written after `ENCRYPTION_KEY` is set uses that key (`v2:`). Rows already stored as `v1:` keep decrypting with `RELAY_SECRET`. Rotating `RELAY_SECRET` still changes signatures. Rotating `ENCRYPTION_KEY` means previously stored `v2:` credentials must be saved again.
 - The relay does not log message bodies or webhook header values. `GET /messages/:id` is limited to the sender and the recipient. Another bot's webhook URL and allowlist are not returned.
 - Run one process against a given SQLite file. The delivery guarantee is at-least-once.
 - Put TLS in front of any deployment that is not on localhost. Relay tokens travel in `Authorization`.
@@ -381,7 +381,7 @@ Environment variables. See `.env.example`.
 | `HOST` | `0.0.0.0` | Listen address |
 | `DATABASE_PATH` | `./data/bot-relay.sqlite` | SQLite file. `:memory:` is supported |
 | `ADMIN_TOKEN` | required | Invite token for `POST /bots` and admin delete. At least 8 characters |
-| `RELAY_SECRET` | required | HMAC key and encryption root. At least 16 characters. Use `openssl rand -hex 32` |
+| `RELAY_SECRET` | required | HMAC key and admin session secret. At least 16 characters. Use `openssl rand -hex 32` |
 | `MAX_HOPS` | `8` | Maximum hop count on a thread |
 | `RATE_LIMIT_MAX` | `60` | Messages per sender per window |
 | `RATE_LIMIT_WINDOW_SEC` | `60` | Rate limit window |
@@ -397,8 +397,28 @@ Environment variables. See `.env.example`.
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | Allow loopback and private webhook or Agent Card hosts |
 | `PUBLIC_BASE_URL` | request host | Absolute origin written into Agent Cards |
 | `A2A_BLOCK_TIMEOUT_MS` | `20000` | How long a blocking A2A call waits for a terminal task |
+| `ENCRYPTION_KEY` | unset | Dedicated AES-256-GCM key for stored credentials. Falls back to `RELAY_SECRET` |
+| `TRUST_PROXY` | `false` | Trust `CF-Connecting-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` |
+| `AUTH_RATE_LIMIT_MAX` | `30` | Per-IP cap for registration and admin login attempts per window |
+| `ADMIN_SESSION_TTL_SEC` | `43200` | Admin browser session lifetime |
 
 Retries run on 408, 429, 5xx, timeouts, and connection errors. Other 4xx responses and redirects fail immediately. The first attempt happens inside the `POST /messages` request. Later attempts run in the background.
+
+## Admin, invites, and registration
+
+`ADMIN_TOKEN` still opens every admin API. Invited people can register a bot without it.
+
+Create an invite from the admin UI or `POST /admin/api/invites` with `{ "max_uses": 1, "ttl_sec": 86400 }`. The response includes the code once and a link `/register?code=...`. `GET /admin/api/invites` lists prefixes, uses, and expiry, not the full code. `POST /admin/api/invites/:id/revoke` retires a code. A code stops working when it is revoked, past `expires_at`, or out of uses.
+
+`POST /register` and `POST /bots` accept `invite_code` when the caller does not send the admin token. `GET /register` is a small form that shows the relay token and `a2a_token` once.
+
+`/admin` is a server-rendered page with no external scripts. Sign in with `POST /admin/login`. The session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` when the request is HTTPS (`X-Forwarded-Proto: https` counts only if `TRUST_PROXY=true`). Mutations from that cookie need the `X-CSRF-Token` from the page. `Authorization: Bearer $ADMIN_TOKEN` still works for API calls and does not use the cookie. When `TRUST_PROXY=true`, a non-empty `CF-Access-Authenticated-User-Email` is also treated as an admin (Cloudflare Access injects it). Do not enable `TRUST_PROXY` unless the relay is reachable only through that proxy. Otherwise a client can spoof the header.
+
+The admin list shows id, display name, delivery mode (`webhook`, `inbox`, or `a2a`), disabled state, and message/delivery counts. It does not show webhook URLs, tokens, or decrypted header values. Disable and enable are `POST /admin/api/bots/:id/disable` and `/enable`. A disabled bot cannot send or receive. Delete remains available.
+
+Registration and admin login attempts are rate limited per client address (`AUTH_RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_SEC`). With `TRUST_PROXY=true` the address is `CF-Connecting-IP`, then the first `X-Forwarded-For` hop.
+
+HTML responses send a strict `Content-Security-Policy` (`default-src 'none'; script-src 'self'; style-src 'self'`). Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. Admin, register, and message routes send `Cache-Control: no-store`.
 
 ## Deploy
 
@@ -416,7 +436,13 @@ fly secrets set ADMIN_TOKEN="$(openssl rand -hex 32)" RELAY_SECRET="$(openssl ra
 
 Set `DATABASE_PATH=/data/bot-relay.sqlite`, mount the volume at `/data`, and set `[http_service] internal_port = 8080`. Do not autoscale past one machine.
 
-**Railway.** The Dockerfile is the build. Add a volume mounted at `/data`, set `DATABASE_PATH=/data/bot-relay.sqlite`, and set `ADMIN_TOKEN` and `RELAY_SECRET`. Leave the private-webhook flags unset.
+**Railway.** The Dockerfile is the build. Add a volume mounted at `/data`, set `DATABASE_PATH=/data/bot-relay.sqlite`, and set `ADMIN_TOKEN`, `RELAY_SECRET`, and `ENCRYPTION_KEY`. Leave the private-webhook flags unset.
+
+**Cloudflare Tunnel and Access.** Run `cloudflared` on the VPS and point a hostname at `http://127.0.0.1:8080`. Set `TRUST_PROXY=true` and `PUBLIC_BASE_URL=https://relay.example.com`. Do not publish port 8080 on the public internet, so clients cannot bypass Cloudflare and spoof `CF-Connecting-IP` or `CF-Access-Authenticated-User-Email`.
+
+Put Cloudflare Access in front of `/admin`. Access adds `CF-Access-Authenticated-User-Email` after a successful login. The relay treats that header as an admin session only when `TRUST_PROXY=true`. You can still require the admin token as a second factor by not relying on the header and signing in on `/admin/login`.
+
+In the Cloudflare WAF, add a rate limiting rule for `POST /register`, `POST /bots`, and `POST /admin/login` (for example 10 requests per minute per IP). The relay applies its own per-IP cap as well. Use the "Bot Fight" or a custom rule to challenge anonymous traffic to `/admin` if Access is not covering it.
 
 **Local production build.**
 

@@ -1,7 +1,7 @@
 import type { Deps } from '../deps.js';
 import { HttpError } from '../errors.js';
 import { VERSION } from '../version.js';
-import { assertWebhookUrl } from '../ssrf.js';
+import { assertWebhookUrl, pinnedFetch } from '../ssrf.js';
 import { isPlainObject, parseHeaderName, parseHeaderValue } from '../validate.js';
 import { A2A_PROTOCOL_VERSION, A2A_SPEC } from './constants.js';
 
@@ -94,7 +94,15 @@ export async function loadRemoteAgent(
 }
 
 async function fetchCard(deps: Deps, url: string): Promise<Record<string, unknown>> {
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const fetchImpl = deps.fetchImpl
+    ? deps.fetchImpl
+    : (url: string, init?: RequestInit) =>
+        pinnedFetch(url, init, {
+          allowHttp: deps.config.allowHttpWebhooks,
+          allowPrivate: deps.config.allowPrivateWebhooks,
+          lookupHost: deps.lookup,
+          timeoutMs: deps.config.deliveryTimeoutMs,
+        });
   let response: Response;
   try {
     response = await fetchImpl(url, {

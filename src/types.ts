@@ -17,6 +17,7 @@ export type Bot = {
   /** Where the stored outbound credential is attached. */
   a2aAuthIn: 'header' | 'query' | null;
   a2aTenant: string | null;
+  disabled: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -103,6 +104,18 @@ export type BotPatch = {
   tokenHash?: string;
   acceptA2a?: boolean;
   a2aInboundTokenHash?: string | null;
+  disabled?: boolean;
+};
+
+export type Invite = {
+  id: number;
+  codePrefix: string;
+  label: string | null;
+  maxUses: number;
+  uses: number;
+  expiresAt: number | null;
+  revokedAt: number | null;
+  createdAt: number;
 };
 
 export type A2aDirection = 'inbound' | 'outbound';

@@ -11,6 +11,7 @@ import type {
   BotPatch,
   DeliveryAttempt,
   IdempotencyRecord,
+  Invite,
   Message,
   MessageStatus,
   NewA2aTask,
@@ -98,6 +99,18 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
 
 CREATE INDEX IF NOT EXISTS idx_a2a_thread ON a2a_tasks(direction, bot_id, thread_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_a2a_remote ON a2a_tasks(direction, bot_id, remote_message_id);
+
+CREATE TABLE IF NOT EXISTS invites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code_hash TEXT NOT NULL UNIQUE,
+  code_prefix TEXT NOT NULL,
+  label TEXT,
+  max_uses INTEGER NOT NULL,
+  uses INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,
+  revoked_at INTEGER,
+  created_at INTEGER NOT NULL
+);
 `;
 
 type RawBot = {
@@ -115,6 +128,7 @@ type RawBot = {
   accept_a2a: number | null;
   a2a_auth_in: string | null;
   a2a_tenant: string | null;
+  disabled: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -255,6 +269,10 @@ export class RelayDb {
     if (Object.prototype.hasOwnProperty.call(patch, 'a2aInboundTokenHash')) {
       sets.push('a2a_inbound_token_hash = ?');
       values.push(patch.a2aInboundTokenHash ?? null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'disabled')) {
+      sets.push('disabled = ?');
+      values.push(patch.disabled ? 1 : 0);
     }
     sets.push('updated_at = ?');
     values.push(now);
@@ -551,6 +569,86 @@ export class RelayDb {
       .run(JSON.stringify({ ...base, ...extra }), id);
   }
 
+  listBots(): Bot[] {
+    const rows = this.sqlite
+      .prepare(`SELECT * FROM bots WHERE id != ? ORDER BY created_at ASC, id ASC`)
+      .all(A2A_GATEWAY_ID) as unknown as RawBot[];
+    return rows.map(mapBot);
+  }
+
+  botStats(id: string): { messages: number; deliveries: number } {
+    const messages = this.sqlite
+      .prepare('SELECT COUNT(*) AS n FROM messages WHERE from_id = ? OR to_id = ?')
+      .get(id, id) as { n: number };
+    const deliveries = this.sqlite
+      .prepare(
+        `SELECT COUNT(*) AS n FROM delivery_attempts a
+         JOIN messages m ON m.id = a.message_id
+         WHERE m.to_id = ? OR m.from_id = ?`,
+      )
+      .get(id, id) as { n: number };
+    return { messages: Number(messages.n), deliveries: Number(deliveries.n) };
+  }
+
+  insertInvite(invite: { codeHash: string; codePrefix: string; label: string | null; maxUses: number; expiresAt: number | null; createdAt: number }): number {
+    const result = this.sqlite
+      .prepare(
+        `INSERT INTO invites (code_hash, code_prefix, label, max_uses, uses, expires_at, revoked_at, created_at)
+         VALUES (?, ?, ?, ?, 0, ?, NULL, ?)`,
+      )
+      .run(invite.codeHash, invite.codePrefix, invite.label, invite.maxUses, invite.expiresAt, invite.createdAt);
+    return Number(result.lastInsertRowid);
+  }
+
+  listInvites(): Invite[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT id, code_prefix, label, max_uses, uses, expires_at, revoked_at, created_at
+         FROM invites ORDER BY id DESC`,
+      )
+      .all() as unknown as Array<{
+      id: number;
+      code_prefix: string;
+      label: string | null;
+      max_uses: number;
+      uses: number;
+      expires_at: number | null;
+      revoked_at: number | null;
+      created_at: number;
+    }>;
+    return rows.map((row) => ({
+      id: Number(row.id),
+      codePrefix: row.code_prefix,
+      label: row.label,
+      maxUses: Number(row.max_uses),
+      uses: Number(row.uses),
+      expiresAt: row.expires_at === null ? null : Number(row.expires_at),
+      revokedAt: row.revoked_at === null ? null : Number(row.revoked_at),
+      createdAt: Number(row.created_at),
+    }));
+  }
+
+  consumeInvite(codeHash: string, now: number): boolean {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE invites
+         SET uses = uses + 1
+         WHERE code_hash = ?
+           AND revoked_at IS NULL
+           AND uses < max_uses
+           AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .run(codeHash, now);
+    return Number(result.changes) === 1;
+  }
+
+  revokeInvite(id: number, now: number): boolean {
+    const result = this.sqlite
+      .prepare(`UPDATE invites SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
+      .run(now, id);
+    return Number(result.changes) === 1;
+  }
+
   finishMessage(id: string, status: 'delivered' | 'failed' | 'inbox', lastError: string | null, deliveredAt: number | null): void {
     this.sqlite
       .prepare(
@@ -594,6 +692,7 @@ function ensureBotColumns(sqlite: DatabaseSync): void {
     ['accept_a2a', 'INTEGER NOT NULL DEFAULT 1'],
     ['a2a_auth_in', 'TEXT'],
     ['a2a_tenant', 'TEXT'],
+    ['disabled', 'INTEGER NOT NULL DEFAULT 0'],
   ];
   for (const [name, ddl] of add) {
     if (!present.has(name)) sqlite.exec(`ALTER TABLE bots ADD COLUMN ${name} ${ddl}`);
@@ -631,6 +730,7 @@ function mapBot(row: RawBot): Bot {
     acceptA2a: row.accept_a2a !== 0,
     a2aAuthIn: row.a2a_auth_in === 'query' ? 'query' : row.a2a_auth_in === 'header' ? 'header' : null,
     a2aTenant: row.a2a_tenant,
+    disabled: row.disabled === 1,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   };

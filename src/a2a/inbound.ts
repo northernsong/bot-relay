@@ -15,6 +15,7 @@ export async function sendToBot(
   params: unknown,
   opts: { stream: boolean },
 ): Promise<{ task: A2aTask; historyLength: number | undefined }> {
+  if (bot.disabled) throw new RpcError(RPC.unsupported, 'This bot is disabled');
   if (!isPlainObject(params)) throw new RpcError(RPC.invalidParams, 'params must be an object');
   if (params.tenant !== undefined) throw new RpcError(RPC.invalidParams, 'This agent has no tenant');
   const parsed = readTextMessage(params.message, deps.config.bodyMaxChars);

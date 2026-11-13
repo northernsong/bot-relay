@@ -2,7 +2,7 @@ import type { Deps } from './deps.js';
 import { envelopeJson } from './envelope.js';
 import { decryptSecret } from './secret.js';
 import { signPayload } from './sign.js';
-import { assertWebhookUrl } from './ssrf.js';
+import { assertWebhookUrl, BlockedAddressError, pinnedFetch } from './ssrf.js';
 import { VERSION } from './version.js';
 
 const ERROR_MAX = 300;
@@ -50,8 +50,8 @@ async function deliverClaimed(deps: Deps, messageId: string, attempt: number): P
   const message = deps.db.getMessage(messageId);
   if (!message) return;
   const recipient = deps.db.getBot(message.toId);
-  if (!recipient) {
-    recordAndSettle(deps, messageId, attempt, null, 'recipient not found', false);
+  if (!recipient || recipient.disabled) {
+    recordAndSettle(deps, messageId, attempt, null, recipient ? 'recipient disabled' : 'recipient not found', false);
     return;
   }
   if (!recipient.webhookUrl) {
@@ -82,7 +82,10 @@ async function deliverClaimed(deps: Deps, messageId: string, attempt: number): P
   };
   if (recipient.authHeaderName && recipient.authHeaderValueEnc) {
     try {
-      headers[recipient.authHeaderName] = decryptSecret(recipient.authHeaderValueEnc, deps.config.relaySecret);
+      headers[recipient.authHeaderName] = decryptSecret(recipient.authHeaderValueEnc, {
+        relaySecret: deps.config.relaySecret,
+        encryptionKey: deps.config.encryptionKey,
+      });
     } catch {
       recordAndSettle(deps, messageId, attempt, null, 'could not decrypt webhook auth header', false);
       return;
@@ -95,7 +98,15 @@ async function deliverClaimed(deps: Deps, messageId: string, attempt: number): P
   headers['x-bot-relay-timestamp'] = String(timestampSec);
   headers['x-bot-relay-id'] = message.id;
 
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const fetchImpl = deps.fetchImpl
+    ? deps.fetchImpl
+    : (url: string, init?: RequestInit) =>
+        pinnedFetch(url, init, {
+          allowHttp: deps.config.allowHttpWebhooks,
+          allowPrivate: deps.config.allowPrivateWebhooks,
+          lookupHost: deps.lookup,
+          timeoutMs: deps.config.deliveryTimeoutMs,
+        });
   let response: Response;
   try {
     response = await fetchImpl(webhookUrl, {
@@ -168,6 +179,9 @@ function recordAndSettle(
 }
 
 function classifyFetchError(err: unknown): { message: string; retryable: boolean } {
+  if (err instanceof BlockedAddressError || (err && typeof err === 'object' && 'name' in err && err.name === 'BlockedAddressError')) {
+    return { message: 'webhook url not allowed', retryable: false };
+  }
   if (err && typeof err === 'object' && 'name' in err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
     return { message: 'timeout', retryable: true };
   }

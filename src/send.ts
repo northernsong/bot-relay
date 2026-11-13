@@ -20,6 +20,8 @@ export async function sendMessage(
   const hash = requestHash(input);
   deps.db.pruneIdempotency(deps.now() - deps.config.idempotencyTtlSec * 1000);
 
+  if (sender.disabled) throw new HttpError(403, 'bot_disabled', 'This bot is disabled');
+
   if (idemKey) {
     const existing = deps.db.getIdempotency(sender.id, idemKey);
     if (existing) return replayOrConflict(deps, existing.messageId, existing.requestHash, hash);
@@ -63,6 +65,7 @@ export async function sendMessage(
       if (!recipient) {
         throw new HttpError(404, 'recipient_not_found', `No bot is registered as "${input.to}"`);
       }
+      if (recipient.disabled) throw new HttpError(403, 'bot_disabled', 'Recipient bot is disabled');
       if (recipient.allowlist && !recipient.allowlist.includes(sender.id)) {
         throw new HttpError(403, 'not_allowed', 'Recipient does not accept messages from this sender');
       }
