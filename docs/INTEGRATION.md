@@ -54,9 +54,9 @@ Registration and admin login are rate limited per client address (`AUTH_RATE_LIM
 | `id` | yes | 2–32 characters: a lowercase letter or digit, then lowercase letters, digits, `_`, or `-`. Pattern `^[a-z0-9][a-z0-9_-]{1,31}$`. Cannot be changed later. Cannot be `me` or `a2a` |
 | `display_name` | yes | 1–80 characters after trim. No ASCII control characters |
 | `webhook_url` | no | Public `https` URL, at most 2048 characters. Omit it to use the inbox only. See [Webhook target rules](#webhook-target-rules) |
-| `auth_header_name` | no | Header the relay will send to your webhook or to your external A2A endpoint. 1–64 characters, `[A-Za-z0-9-]`. Cannot be `Host`, `Content-Type`, `Content-Length`, or any `X-Bot-Relay-*` header |
+| `auth_header_name` | no | Header the relay will send to your webhook or to your external A2A endpoint. 1–64 characters, `[A-Za-z0-9-]`. Rejected names are exactly `Host`, `Content-Type`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authorization`, `X-Bot-Relay-Signature`, `X-Bot-Relay-Timestamp`, and `X-Bot-Relay-Id`. Other names such as `X-Bot-Relay-Foo` pass validation and are forwarded. Do not invent an `X-Bot-Relay-` prefix |
 | `auth_header_value` | no | 1–4096 characters, no CR, LF, or NUL. Set together with `auth_header_name`. This is the webhook credential. There is no `webhook_secret` field |
-| `allowlist` | no | `null` or omitted: accept any registered sender, including inbound A2A (that sender id is the built-in gateway `a2a`). `[]`: accept nobody. A list of bot ids (max 100, duplicates removed): accept only those ids. Each entry uses the same pattern as `id` and cannot be the reserved ids `me` or `a2a`, so a non-null list cannot name the gateway. Inbound A2A then returns `-32004`. Leave the list `null` when A2A callers should reach this bot |
+| `allowlist` | no | `null` or omitted: accept any registered sender, including inbound A2A (that sender id is the built-in gateway `a2a`). `[]`: accept nobody. A list of bot ids: the length is checked before duplicates are removed, and more than 100 entries is `400`. Each entry uses the same pattern as `id` and cannot be the reserved ids `me` or `a2a`, so a non-null list cannot name the gateway. Inbound A2A then returns `-32004`. Leave the list `null` when A2A callers should reach this bot |
 | `a2a_card_url` | no | Agent Card URL of an external A2A agent. Do not send this together with `webhook_url` |
 | `accept_a2a` | no | Boolean. Default `true` for a bot hosted on the relay, which mints `a2a_token`. An external agent (`a2a_card_url`) must omit this or send `false` |
 
@@ -185,7 +185,7 @@ For a hosted bot, `a2a_card_url` in this JSON is `null`. Callers discover you at
 GET $BASE/a2a/bots/{id}/.well-known/agent-card.json
 ```
 
-The card's JSON-RPC URL is `POST $BASE/a2a/bots/{id}`. Give callers your bot id and your `a2a_token`. Do not give them your relay `token`.
+The card's JSON-RPC URL is the absolute URL `$BASE/a2a/bots/{id}` (`supportedInterfaces[0].url`). Callers `POST` that URL. Give callers your bot id and your `a2a_token`. Do not give them your relay `token`.
 
 An external A2A registration (`kind` `a2a`) returns `a2a_card_url` and `a2a_endpoint`, `accept_a2a: false`, and no `a2a_token`. It still returns a relay `token` so the operator can `PATCH` or `DELETE` that registration. The relay itself calls the remote agent; the remote agent does not use this token to receive.
 
@@ -195,7 +195,7 @@ Keep tokens in a secret store or an environment variable. Do not commit them, lo
 
 `PATCH /bots/me` with the relay token. At least one field is required. Accepted fields: `display_name`, `webhook_url`, `auth_header_name`, `auth_header_value`, `allowlist`, `rotate_token`, `accept_a2a`, `rotate_a2a_token`.
 
-`webhook_url: null` removes the webhook and leaves the bot on inbox polling. Clearing the auth header requires `auth_header_name: null` and an empty or null `auth_header_value` together. Setting a new `auth_header_value` does not echo it back.
+`webhook_url: null` removes the webhook and leaves the bot on inbox polling. `auth_header_name: null` alone clears the stored name and value. You do not also have to send `auth_header_value: null`. Sending a non-empty `auth_header_value` while clearing the name returns `400` with message `Cannot set auth_header_value while clearing auth_header_name`. Setting a new `auth_header_value` does not echo it back. Boolean and array fields (`accept_a2a`, `allowlist`) must be JSON. `POST /register` accepts `application/x-www-form-urlencoded`, but every form value is a string.
 
 `a2a_card_url` cannot be changed with `PATCH`. Delete the bot and register it again to point at a different Agent Card.
 
@@ -930,7 +930,7 @@ When the result has text, the relay sends that text back to the original sender 
 - `hop` is one higher than the outbound message
 - `metadata` is `{ "a2a_task_id", "a2a_state" }`
 
-The sender receives it on their webhook or inbox. The hop limit, allowlist, and the sender's rate limit apply to the original send. The forwarded reply does not consume another rate-limit slot. If the reply text is longer than `BODY_MAX_CHARS`, it is truncated. If the forward itself fails, the outbound message stays `delivered` and its metadata gains `a2a_forward_error`.
+The sender receives it on their webhook or inbox when that second send succeeds. `forwardReply` calls `sendMessage` with the external agent as `from`, the original sender as `to`, and `skipRateLimit: true`, so the reply does not consume another rate-limit slot. The original sender's own `allowlist` must be `null` or include this external id, and the reply hop must still be within `MAX_HOPS`. A sender whose allowlist is only `["bob"]` will not receive `weather`'s reply. If that check fails, the outbound message stays `delivered` and its metadata gains `a2a_forward_error`. The hop limit, allowlist, and rate limit of the original `POST /messages` still apply to that first send. If the reply text is longer than `BODY_MAX_CHARS`, it is truncated.
 
 Your agent does not call `POST /messages` to answer. Put the answer in the `SendMessage` task artifact. The relay writes the reply.
 
@@ -961,7 +961,7 @@ Error JSON for relay routes:
 | `409` | `already_registered` | `id` is taken |
 | `409` | `idempotency_conflict` | This `Idempotency-Key` was already used with a different payload |
 | `409` | `hop_limit` | This thread has reached `MAX_HOPS` |
-| `413` | `payload_too_large` | Body, metadata, or raw request is over the limit |
+| `413` | `payload_too_large` | On routes that use `readJsonObject` (`POST /messages`, `POST /bots`, `PATCH /bots/me`, `POST /inbox/ack`, JSON `POST /register`): raw body over 65536 characters, or `body` / `metadata` over their own limits. `POST /a2a/bots/:id` over 65536 characters is HTTP `413` with JSON-RPC `-32600`, not this `error.code`. `POST /admin/login` and `POST /admin/api/invites` do not apply the 65536 cap |
 | `415` | `unsupported_media_type` | JSON route did not receive `Content-Type: application/json` |
 | `429` | `rate_limited` | Per-sender send limit, or per-address registration / admin-login limit. Honor `Retry-After` and `error.retry_after` |
 | `503` | — | `GET /health` when SQLite is unreachable: `{ "ok": false, "version": "0.1.0", "db": "error" }` |
@@ -1020,7 +1020,7 @@ The body is `{ "jsonrpc": "2.0", "id", "error": { "code", "message", "data"? } }
 | `POST` | `/inbox/ack` | relay token | `{ "ids": ["msg_…"] }` |
 | `GET` | `/a2a/bots/:id/.well-known/agent-card.json` | none | Agent Card for a hosted bot |
 | `POST` | `/a2a/bots/:id` | that bot's `a2a_token` | A2A JSON-RPC |
-| `GET` | `/admin` | admin session or Access | Operator UI |
+| `GET` | `/admin` | `br_session` cookie only | Operator UI. No cookie, a bad signature, or an expired session is JSON `401` `Admin login required`. Bearer `ADMIN_TOKEN` and `CF-Access-Authenticated-User-Email` do not open this page |
 | `POST` | `/admin/login` | admin token in the body | Start an admin browser session |
 | `POST` | `/admin/api/invites` | admin | Create an invite. The code is returned once |
 | `GET` | `/admin/api/invites` | admin | List invites without the full code |

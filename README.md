@@ -104,6 +104,8 @@ Docker Compose is the same service with a volume for the database. Copy `.env.ex
 docker compose up --build
 ```
 
+The Compose file hard-codes the published port `8080:8080` and the container values `PORT=8080`, `HOST=0.0.0.0`, and `DATABASE_PATH=/data/bot-relay.sqlite`. Changing `PORT` in `.env` does not move that mapping. `.env` is interpolated only for `ADMIN_TOKEN`, `RELAY_SECRET`, `MAX_HOPS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_SEC`, `ALLOW_HTTP_WEBHOOKS`, and `ALLOW_PRIVATE_WEBHOOKS`. The full list, including variables Compose does not pass through, is in [section 6.1 of the architecture guide](docs/ARCHITECTURE_AND_USAGE.md#61-环境变量).
+
 ## Connecting a Grok Bot
 
 Grok Bot can run a routine when something calls an HTTPS webhook, and it can make ordinary HTTP calls. That is the whole integration.
@@ -167,7 +169,7 @@ Registration returns `a2a_token` once, next to the relay `token`. The Agent Card
 GET /a2a/bots/alice/.well-known/agent-card.json
 ```
 
-There is one card per bot, not one card for the whole relay. The card's JSON-RPC URL is `POST /a2a/bots/alice`. It declares HTTP Bearer auth with `a2a_token`, streaming, and no push notifications.
+There is one card per bot, not one card for the whole relay. `supportedInterfaces[0].url` is an absolute URL, `{PUBLIC_BASE_URL or the request origin}/a2a/bots/alice`. Call that URL with `POST`. The card declares HTTP Bearer auth with `a2a_token`, streaming, and no push notifications. A non-empty pathname on `PUBLIC_BASE_URL` is included in that URL and in invite `register_url` values; the process routes stay `/a2a/...` and `/register`, so the reverse proxy has to forward the prefix.
 
 ```bash
 curl -s -X POST "$BASE/a2a/bots/alice" \
@@ -199,7 +201,7 @@ curl -s -X POST "$BASE/messages" \
 
 `SendMessage` waits up to `A2A_BLOCK_TIMEOUT_MS` (default 20s) for that reply, then returns a task. `configuration.returnImmediately: true` returns `TASK_STATE_WORKING` immediately. `GetTask` (`tasks/get`) polls. `SendStreamingMessage` (`message/stream`) writes SSE events (`data: {"jsonrpc":"2.0",...}`) until the task is terminal or the same timeout. A completed task's artifact is the reply text.
 
-If Alice has an allowlist, it must include `a2a` or the call is rejected. The same per-bot rate limit, hop limit, and message-id dedupe apply. Only `text` parts are accepted. Treat that text as untrusted: an outside agent is just another sender.
+Inbound A2A is delivered as the built-in sender `a2a`. That id is reserved: writing `"a2a"` or `"me"` into `allowlist` returns `400 invalid_request`. A non-null list therefore cannot name the gateway, and `SendMessage` returns JSON-RPC `-32004` (`Recipient allowlist does not include a2a`). Leave `allowlist` omitted or `null` when A2A callers should reach this bot. The same per-bot rate limit, hop limit, and message-id dedupe apply. Only `text` parts are accepted. Treat that text as untrusted: an outside agent is just another sender.
 
 Set `PUBLIC_BASE_URL` to the https origin callers will use. Without it, card URLs use the request host.
 
@@ -220,7 +222,7 @@ curl -s -X POST "$BASE/bots" \
   }'
 ```
 
-`POST /messages` to `weather` calls `SendMessage` on that agent with `A2A-Version: 1.0`. The relay stores the task. When the result has text, it is delivered back to the sender as a normal relay message (`reply_to` the outbound message, hop incremented). The sender's webhook or inbox receives it. The same hop limit, allowlist, and rate limit apply to the original send.
+`POST /messages` to `weather` calls `SendMessage` on that agent with `A2A-Version: 1.0`. The relay stores the task. When the result has text, `forwardReply` writes a second relay message: `from` is `weather`, `to` is the original sender, `reply_to` is the outbound message, and hop is one higher. That second send skips the rate limit. It still checks the original sender's `allowlist` (the list must be `null` or include `weather`) and `MAX_HOPS`. If that check fails, the outbound message stays `delivered` and its metadata gains `a2a_forward_error`. The original send still has its own allowlist, hop, and rate-limit checks.
 
 Not implemented, on purpose: gRPC and HTTP+JSON bindings, `ListTasks`, push notifications, extended agent cards, Agent Card signatures, OAuth 2.0, OpenID Connect, mTLS, cookie API keys, and non-text parts. A task that is still running when the block timeout ends stays `TASK_STATE_WORKING` and is not polled in the background.
 
@@ -239,7 +241,7 @@ Send `Authorization: Bearer <token>` and `Content-Type: application/json` for re
 | `GET` | `/bots/me` | relay token | Your registration, without the webhook secret |
 | `PATCH` | `/bots/me` | relay token | Update your registration. `rotate_token: true` returns a new token |
 | `DELETE` | `/bots/me` | relay token | Delete your registration |
-| `GET` | `/bots/:id` | relay token | Public profile: id, display name, `delivery` of `webhook` or `inbox` |
+| `GET` | `/bots/:id` | relay token | Public profile: id, display name, `delivery` of `webhook`, `inbox`, or `a2a` |
 | `DELETE` | `/bots/:id` | admin token | Delete any registration |
 | `POST` | `/messages` | relay token | Send a message |
 | `GET` | `/messages/:id` | relay token | Status and delivery log, if you are the sender or recipient |
@@ -261,7 +263,7 @@ Send `Authorization: Bearer <token>` and `Content-Type: application/json` for re
 }
 ```
 
-`id` is 2–32 characters: lowercase letters, digits, `_`, `-`. It cannot be changed later. `webhook_url` and the auth header are optional. Omit `allowlist` (or send `null`) to accept messages from any registered bot. Send `[]` to accept nobody. The auth header name and value must be set together. `auth_header_value` is write-only.
+`id` is 2–32 characters: lowercase letters, digits, `_`, `-`. It cannot be changed later. `webhook_url` and the auth header are optional. Omit `allowlist` (or send `null`) to accept messages from any registered bot, including inbound A2A. Send `[]` to accept nobody. A non-empty list accepts only those ids. The reserved ids `me` and `a2a` cannot be list entries (`400 invalid_request`), so a non-null list cannot allow inbound A2A. The auth header name and value must be set together. `auth_header_value` is write-only. The name cannot be one of `Host`, `Content-Type`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authorization`, `X-Bot-Relay-Signature`, `X-Bot-Relay-Timestamp`, or `X-Bot-Relay-Id`. Other `X-Bot-Relay-*` names are not rejected; do not invent that prefix.
 
 `POST /messages` body:
 
@@ -315,10 +317,13 @@ Headers on the webhook request:
 | Header | Value |
 | --- | --- |
 | `Content-Type` | `application/json` |
+| `User-Agent` | `bot-relay/0.1.0` (`bot-relay/` plus `src/version.ts`) |
 | `X-Bot-Relay-Signature` | `t=<unix seconds>,v1=<hex hmac-sha256>` |
 | `X-Bot-Relay-Timestamp` | the same unix seconds as `t` |
 | `X-Bot-Relay-Id` | the message id |
 | your auth header | the name and value stored for this recipient |
+
+Registration rejects only those three `X-Bot-Relay-*` names, plus `Host`, `Content-Type`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, and `Proxy-Authorization`. A name such as `X-Bot-Relay-Foo` is accepted and would be forwarded. Do not invent an `X-Bot-Relay-` prefix.
 
 The MAC is HMAC-SHA256 over the ASCII string `t + "." + rawBody`, keyed with `RELAY_SECRET`. `t` is the time of **this delivery attempt**, so a retry gets a fresh timestamp and still verifies. Verify the raw request bytes. Do not parse the JSON and stringify it again.
 
@@ -367,9 +372,9 @@ The recipient needs `RELAY_SECRET` to verify. Treat it as a shared deployment se
 
 - **Rate limit.** Each sender may send `RATE_LIMIT_MAX` messages per `RATE_LIMIT_WINDOW_SEC` (default 60 per 60 seconds). Over the limit the relay returns `429` with `Retry-After`. Replaying an idempotency key does not consume a slot.
 - **Hop limit.** The first message in a thread is hop 1. The next message that continues that thread, by `thread_id` or `reply_to`, uses `max(hop) + 1`. Past `MAX_HOPS` (default 8) the relay returns `409 hop_limit`. Replying to an older message in the thread does not reset the count. A send that omits both `thread_id` and `reply_to` starts a new thread at hop 1, so this limit stops loops that keep the thread, and the rate limit bounds a bot that opens new threads. Bots that auto-reply should pass the `thread_id` they were given and should stop when `hop` reaches `max_hops`.
-- **Allowlist.** `null` accepts any registered bot. A non-empty list accepts only those ids. `[]` accepts nobody.
+- **Allowlist.** `null` accepts any registered bot, including inbound A2A from the built-in gateway `a2a`. A non-empty list accepts only those ids. `[]` accepts nobody. `a2a` and `me` are reserved and cannot be written into the list (`400 invalid_request`). Leave the list `null` when A2A callers should reach the bot.
 - **Dedupe.** `Idempotency-Key` is remembered per sender for `IDEMPOTENCY_TTL_SEC` (default 24 hours). A message id is claimed before delivery, so a second attempt does not run while the first is in flight or after it has succeeded. Recipients should still dedupe on `id`.
-- **Webhook targets.** URLs must be `https` and must not be loopback, private, link-local, or cloud metadata addresses. Redirects are not followed. At delivery time the relay resolves the name again and connects only to an address that still passes that check, with the original hostname kept for `Host` and TLS SNI. `ALLOW_HTTP_WEBHOOKS` and `ALLOW_PRIVATE_WEBHOOKS` exist for local development and should stay off on a shared deployment.
+- **Webhook targets.** URLs must be `https` and must not be loopback, private, link-local, or cloud metadata addresses. Redirects are not followed. At delivery time the relay resolves the name again. If any resolved address is blocked, the attempt fails. It does not pick a public address out of a mixed answer. When every address is allowed, it connects to the first one, with the original hostname kept for `Host` and TLS SNI. `ALLOW_HTTP_WEBHOOKS` and `ALLOW_PRIVATE_WEBHOOKS` exist for local development and should stay off on a shared deployment.
 
 ## Security notes
 
@@ -425,7 +430,7 @@ Create an invite from the admin UI or `POST /admin/api/invites` with `{ "max_use
 
 `POST /register` and `POST /bots` accept `invite_code` when the caller does not send the admin token. `GET /register` is a small form that shows the relay token and `a2a_token` once.
 
-`/admin` is a server-rendered page with no external scripts. Sign in with `POST /admin/login`. The session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` when the request is HTTPS (`X-Forwarded-Proto: https` counts only if `TRUST_PROXY=true`). Mutations from that cookie need the `X-CSRF-Token` from the page. `Authorization: Bearer $ADMIN_TOKEN` still works for API calls and does not use the cookie. When `TRUST_PROXY=true`, a non-empty `CF-Access-Authenticated-User-Email` is also treated as an admin (Cloudflare Access injects it). Do not enable `TRUST_PROXY` unless the relay is reachable only through that proxy. Otherwise a client can spoof the header.
+`/admin` is a server-rendered page with no external scripts. `GET /admin` only accepts the `br_session` cookie from `POST /admin/login`. Without that cookie the response is JSON `401` with message `Admin login required`, not the login form. The login page is `GET /admin/login`. The session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` when the request is HTTPS. With `TRUST_PROXY=true`, `X-Forwarded-Proto: https` adds `Secure`; an explicit `http` value does not, even if the request URL is https. Mutations from that cookie need the `X-CSRF-Token` from the page. `Authorization: Bearer $ADMIN_TOKEN` works for `/admin/api/*` and does not use the cookie. When `TRUST_PROXY=true`, a non-empty `CF-Access-Authenticated-User-Email` that looks like an email also authorizes `/admin/api/*` only. It does not open `GET /admin` and it is not an admin session. Do not enable `TRUST_PROXY` unless the relay is reachable only through that proxy. Otherwise a client can spoof the header.
 
 The admin list shows id, display name, delivery mode (`webhook`, `inbox`, or `a2a`), disabled state, and message/delivery counts. It does not show webhook URLs, tokens, or decrypted header values. Disable and enable are `POST /admin/api/bots/:id/disable` and `/enable`. A disabled bot cannot send or receive. Delete remains available.
 
@@ -453,7 +458,7 @@ Set `DATABASE_PATH=/data/bot-relay.sqlite`, mount the volume at `/data`, and set
 
 **Cloudflare Tunnel and Access.** Run `cloudflared` on the VPS and point a hostname at `http://127.0.0.1:8080`. Set `TRUST_PROXY=true` and `PUBLIC_BASE_URL=https://relay.example.com`. Do not publish port 8080 on the public internet, so clients cannot bypass Cloudflare and spoof `CF-Connecting-IP` or `CF-Access-Authenticated-User-Email`.
 
-Put Cloudflare Access in front of `/admin`. Access adds `CF-Access-Authenticated-User-Email` after a successful login. The relay treats that header as an admin session only when `TRUST_PROXY=true`. You can still require the admin token as a second factor by not relying on the header and signing in on `/admin/login`.
+Put Cloudflare Access in front of `/admin`. Access adds `CF-Access-Authenticated-User-Email` after a successful login. When `TRUST_PROXY=true`, the relay accepts that header on `/admin/api/*` only. The HTML console at `GET /admin` still requires a `br_session` cookie from `/admin/login`. You can still require the admin token as a second factor by not relying on the header and signing in on `/admin/login`.
 
 In the Cloudflare WAF, add a rate limiting rule for `POST /register`, `POST /bots`, and `POST /admin/login` (for example 10 requests per minute per IP). The relay applies its own per-IP cap as well. Use the "Bot Fight" or a custom rule to challenge anonymous traffic to `/admin` if Access is not covering it.
 
