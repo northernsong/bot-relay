@@ -10,9 +10,13 @@ export function readBearer(header: string | undefined): string | null {
   return match[1] ?? null;
 }
 
-export function requireAdmin(deps: Deps, header: string | undefined): void {
+export function isAdminBearer(deps: Deps, header: string | undefined): boolean {
   const token = readBearer(header);
-  if (!token || !secretsMatch(token, deps.config.adminToken)) {
+  return Boolean(token && secretsMatch(token, deps.config.adminToken));
+}
+
+export function requireAdmin(deps: Deps, header: string | undefined): void {
+  if (!isAdminBearer(deps, header)) {
     throw new HttpError(401, 'unauthorized', 'Admin token required', { 'www-authenticate': 'Bearer' });
   }
 }

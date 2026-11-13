@@ -38,6 +38,10 @@ export function makeApp(overrides: Partial<Config> = {}): { app: Hono; deps: Dep
     allowPrivateWebhooks: true,
     publicBaseUrl: null,
     a2aBlockTimeoutMs: 20_000,
+    encryptionKey: null,
+    trustProxy: false,
+    authRateLimitMax: 30,
+    adminSessionTtlSec: 3600,
     ...overrides,
     databasePath: ':memory:',
   };

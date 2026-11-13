@@ -4,6 +4,7 @@ import type { Deps } from '../deps.js';
 import { decryptSecret } from '../secret.js';
 import { sendMessage } from '../send.js';
 import type { Bot, Message } from '../types.js';
+import { pinnedFetch } from '../ssrf.js';
 import { isPlainObject } from '../validate.js';
 import { A2A_PROTOCOL_VERSION, isTerminal } from './constants.js';
 import { partsText } from './protocol.js';
@@ -99,7 +100,10 @@ async function call(deps: Deps, peer: Bot, method: string, params: Record<string
   };
   let url = peer.a2aEndpoint ?? '';
   if (peer.authHeaderName && peer.authHeaderValueEnc) {
-    const value = decryptSecret(peer.authHeaderValueEnc, deps.config.relaySecret);
+    const value = decryptSecret(peer.authHeaderValueEnc, {
+      relaySecret: deps.config.relaySecret,
+      encryptionKey: deps.config.encryptionKey,
+    });
     if (peer.a2aAuthIn === 'query') {
       const parsed = new URL(url);
       parsed.searchParams.set(peer.authHeaderName, value);
@@ -108,7 +112,15 @@ async function call(deps: Deps, peer: Bot, method: string, params: Record<string
       headers[peer.authHeaderName] = value;
     }
   }
-  const fetchImpl = deps.fetchImpl ?? fetch;
+  const fetchImpl = deps.fetchImpl
+    ? deps.fetchImpl
+    : (url: string, init?: RequestInit) =>
+        pinnedFetch(url, init, {
+          allowHttp: deps.config.allowHttpWebhooks,
+          allowPrivate: deps.config.allowPrivateWebhooks,
+          lookupHost: deps.lookup,
+          timeoutMs: deps.config.deliveryTimeoutMs,
+        });
   const response = await fetchImpl(url, {
     method: 'POST',
     headers,

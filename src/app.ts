@@ -4,11 +4,13 @@ import type { Context } from 'hono';
 import { loadRemoteAgent } from './a2a/card.js';
 import { A2A_GATEWAY_ID } from './a2a/constants.js';
 import { registerA2aRoutes } from './a2a/routes.js';
-import { requireAdmin, requireBot } from './auth.js';
+import { registerAdminRoutes } from './admin/routes.js';
+import { isAdminBearer, requireAdmin, requireBot } from './auth.js';
+import { limitAuth } from './client-ip.js';
 import type { Deps } from './deps.js';
 import { HttpError, isUniqueConstraint } from './errors.js';
 import { presentMessage, presentOwnBot, presentPublicBot } from './present.js';
-import { encryptSecret, hashToken, newA2aToken, newToken } from './secret.js';
+import { encryptSecret, hashToken, newA2aToken, newToken, type CryptoKeys } from './secret.js';
 import { sendMessage } from './send.js';
 import { assertWebhookUrl } from './ssrf.js';
 import type { Bot, BotKind, BotPatch, SendInput } from './types.js';
@@ -34,6 +36,24 @@ const MAX_REQUEST_CHARS = 65_536;
 export function createApp(deps: Deps): Hono {
   const app = new Hono();
 
+  app.use('*', async (c, next) => {
+    await next();
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('X-Frame-Options', 'DENY');
+    c.header('Referrer-Policy', 'no-referrer');
+    const type = c.res.headers.get('content-type') ?? '';
+    if (type.includes('text/html')) {
+      c.header(
+        'Content-Security-Policy',
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+      );
+    }
+    const path = c.req.path;
+    if (path.startsWith('/admin') || path.startsWith('/register') || path.startsWith('/bots') || path.startsWith('/messages') || path.startsWith('/inbox')) {
+      c.header('Cache-Control', 'no-store');
+    }
+  });
+
   app.onError((err, c) => {
     if (err instanceof HttpError) {
       if (err.headers) {
@@ -58,8 +78,23 @@ export function createApp(deps: Deps): Hono {
   });
 
   app.post('/bots', async (c) => {
-    requireAdmin(deps, c.req.header('authorization'));
+    await limitAuth(deps, c, 'register');
     const body = await readJsonObject(c);
+    const inviteHash = inviteHashForRegistration(deps, c.req.header('authorization'), body.invite_code);
+    return c.json(await performRegistration(deps, body, inviteHash), 201);
+  });
+
+  app.post('/register', async (c) => {
+    await limitAuth(deps, c, 'register');
+    const body = await readFlexibleObject(c);
+    if (typeof body.invite_code !== 'string') {
+      throw new HttpError(403, 'invite_invalid', 'Invite code required');
+    }
+    const created = await performRegistration(deps, body, hashToken(body.invite_code.trim()));
+    return c.json(created, 201);
+  });
+
+async function performRegistration(deps: Deps, body: Record<string, unknown>, inviteHash: string | null): Promise<Record<string, unknown>> {
     rejectUnknown(body, [
       'id',
       'display_name',
@@ -69,6 +104,7 @@ export function createApp(deps: Deps): Hono {
       'allowlist',
       'a2a_card_url',
       'accept_a2a',
+      'invite_code',
     ]);
     const id = parseBotId(body.id);
     const displayName = parseDisplayName(body.display_name);
@@ -106,12 +142,16 @@ export function createApp(deps: Deps): Hono {
     const token = newToken();
     const now = deps.now();
     try {
+      deps.db.transaction(() => {
+      if (inviteHash && !deps.db.consumeInvite(inviteHash, now)) {
+        throw new HttpError(403, 'invite_invalid', 'Invite code is invalid, expired, revoked, or used up');
+      }
       deps.db.insertBot({
         id,
         displayName,
         webhookUrl,
         authHeaderName: auth.name,
-        authHeaderValueEnc: auth.value ? encryptSecret(auth.value, deps.config.relaySecret) : null,
+        authHeaderValueEnc: auth.value ? encryptSecret(auth.value, cryptoKeys(deps)) : null,
         tokenHash: hashToken(token),
         allowlist,
         kind,
@@ -124,6 +164,7 @@ export function createApp(deps: Deps): Hono {
         createdAt: now,
         updatedAt: now,
       });
+      });
     } catch (err) {
       if (isUniqueConstraint(err, 'bots.id')) {
         throw new HttpError(409, 'already_registered', `Bot id "${id}" is already registered`);
@@ -132,8 +173,8 @@ export function createApp(deps: Deps): Hono {
     }
     const bot = deps.db.getBot(id);
     if (!bot) throw new HttpError(500, 'internal', 'Bot disappeared after insert');
-    return c.json(presentOwnBot(bot, token, a2aToken), 201);
-  });
+    return presentOwnBot(bot, token, a2aToken);
+}
 
   app.get('/bots/me', (c) => {
     const bot = requireBot(deps, c.req.header('authorization'));
@@ -276,8 +317,33 @@ export function createApp(deps: Deps): Hono {
     return c.json({ acked });
   });
 
+  registerAdminRoutes(app, deps);
   registerA2aRoutes(app, deps);
   return app;
+}
+
+function inviteHashForRegistration(deps: Deps, authorization: string | undefined, inviteCode: unknown): string | null {
+  if (isAdminBearer(deps, authorization)) return null;
+  if (typeof inviteCode !== 'string' || !/^inv_[A-Za-z0-9_-]{16,80}$/.test(inviteCode.trim())) {
+    throw new HttpError(401, 'unauthorized', 'Admin token or invite code required', { 'www-authenticate': 'Bearer' });
+  }
+  return hashToken(inviteCode.trim());
+}
+
+async function readFlexibleObject(c: Context): Promise<Record<string, unknown>> {
+  const contentType = c.req.header('content-type')?.split(';')[0]?.trim().toLowerCase();
+  if (contentType === 'application/x-www-form-urlencoded') {
+    const raw = await c.req.text();
+    const params = new URLSearchParams(raw);
+    const body: Record<string, unknown> = {};
+    for (const [key, value] of params.entries()) body[key] = value;
+    return body;
+  }
+  return readJsonObject(c);
+}
+
+function cryptoKeys(deps: Deps): CryptoKeys {
+  return { relaySecret: deps.config.relaySecret, encryptionKey: deps.config.encryptionKey };
 }
 
 function parseBool(value: unknown, field: string): boolean {
@@ -367,6 +433,6 @@ function applyAuthPatch(deps: Deps, bot: Bot, body: Record<string, unknown>, pat
   }
 
   patch.authHeaderName = name;
-  if (valueAction === 'set') patch.authHeaderValueEnc = encryptSecret(newValue, deps.config.relaySecret);
+  if (valueAction === 'set') patch.authHeaderValueEnc = encryptSecret(newValue, cryptoKeys(deps));
   if (valueAction === 'clear') patch.authHeaderValueEnc = null;
 }

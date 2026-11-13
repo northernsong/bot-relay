@@ -21,6 +21,13 @@ export type Config = {
   publicBaseUrl: string | null;
   /** How long a blocking A2A call waits for a bot reply or a remote terminal task. */
   a2aBlockTimeoutMs: number;
+  /** Optional dedicated AES key. Null means new secrets still use RELAY_SECRET. */
+  encryptionKey: string | null;
+  /** Trust CF-Connecting-IP / X-Forwarded-For / X-Forwarded-Proto from a reverse proxy. */
+  trustProxy: boolean;
+  /** Per-IP cap for registration and admin login attempts. */
+  authRateLimitMax: number;
+  adminSessionTtlSec: number;
 };
 
 type Env = Record<string, string | undefined>;
@@ -47,6 +54,10 @@ export function loadConfig(env: Env = process.env): Config {
     allowPrivateWebhooks: boolEnv(env, 'ALLOW_PRIVATE_WEBHOOKS', false),
     publicBaseUrl: optionalBaseUrl(env, 'PUBLIC_BASE_URL'),
     a2aBlockTimeoutMs: intEnv(env, 'A2A_BLOCK_TIMEOUT_MS', 20_000, 0, 120_000),
+    encryptionKey: optionalSecret(env, 'ENCRYPTION_KEY', 16),
+    trustProxy: boolEnv(env, 'TRUST_PROXY', false),
+    authRateLimitMax: intEnv(env, 'AUTH_RATE_LIMIT_MAX', 30, 1, 100_000),
+    adminSessionTtlSec: intEnv(env, 'ADMIN_SESSION_TTL_SEC', 12 * 3600, 60, 30 * 86_400),
   };
 }
 
@@ -64,6 +75,18 @@ function optionalBaseUrl(env: Env, name: string): string | null {
   }
   const path = url.pathname.replace(/\/$/, '');
   return `${url.origin}${path}`;
+}
+
+function optionalSecret(env: Env, name: string, min: number): string | null {
+  const value = env[name];
+  if (value === undefined || value === '') return null;
+  if (value.length < min) {
+    throw new Error(`${name} must be at least ${min} characters. Generate one with: openssl rand -hex 32`);
+  }
+  if (value.includes('\n') || value.includes('\r') || value !== value.trim()) {
+    throw new Error(`${name} must not contain whitespace or newlines`);
+  }
+  return value;
 }
 
 function secretEnv(env: Env, name: string, min: number): string {

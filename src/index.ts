@@ -16,6 +16,15 @@ const config = (() => {
   }
 })();
 
+if (!config.encryptionKey) {
+  console.warn(
+    JSON.stringify({
+      level: 'warn',
+      msg: 'ENCRYPTION_KEY is not set. Stored webhook and A2A credentials are encrypted with a key derived from RELAY_SECRET. Set ENCRYPTION_KEY to separate them.',
+    }),
+  );
+}
+
 const db = openDatabase(config.databasePath);
 const deps: Deps = { config, db, now: () => Date.now() };
 const app = createApp(deps);
