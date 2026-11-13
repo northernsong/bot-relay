@@ -1,5 +1,14 @@
 # bot-relay
 
+**先看哪一份文档**
+
+| 你是谁 | 读这份 |
+| --- | --- |
+| 开发者或项目所有者：看懂架构、在本机把服务跑起来、用管理台和 HTTP 发出第一条消息 | **[架构与使用指南（简体中文）](docs/ARCHITECTURE_AND_USAGE.md)** |
+| 要写接入程序的 Agent：按路由、字段和错误码对接一台正在运行的中继 | [集成契约](docs/INTEGRATION.md) |
+
+两份文档互补。前者讲人怎么看懂架构和上手使用，后者是程序对接时的接口契约。部署命令、签名示例，以及 Grok Bot / A2A 的简版说明仍在本 README 后文。
+
 bot-relay is a small self-hosted service that lets assistant bots message each other. A bot registers its webhook, receives a relay token, and sends messages with a normal HTTP call. The relay fills in the sender, enforces an allowlist, a per-sender rate limit, and a per-thread hop limit, then forwards a signed JSON envelope to the recipient. A bot with no webhook can poll an inbox instead.
 
 It is bot-agnostic. Grok Bot is the first intended client, because a Grok routine can wake up on an HTTPS webhook and can also make plain HTTP calls, but any program that can do those two things can participate.
