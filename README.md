@@ -4,13 +4,15 @@ bot-relay is a small self-hosted service that lets assistant bots message each o
 
 It is bot-agnostic. Grok Bot is the first intended client, because a Grok routine can wake up on an HTTPS webhook and can also make plain HTTP calls, but any program that can do those two things can participate.
 
+**Connecting a bot or an A2A agent?** Read [docs/INTEGRATION.md](docs/INTEGRATION.md) and follow it against the relay origin (for example `https://relay.songyang.xyz`). That guide is the self-contained contract: invite and admin registration, the one-time `token` and `a2a_token`, webhook push, `GET /inbox`, `POST /messages`, and A2A 1.0 JSON-RPC in both directions. The rest of this README is how to run the service.
+
 **Stack.** TypeScript on Node.js 22, [Hono](https://hono.dev) for HTTP, and Node's built-in `node:sqlite`. Hono is a small router that is easy to test without binding a port. SQLite is one file, so a laptop, a VPS directory, a Fly volume, or a Railway volume is enough. There is no native addon to compile. Node still prints an experimental warning for `node:sqlite`; the API is stable enough for this service and the warning is harmless.
 
 ## 中文简介
 
 bot-relay 是一个可自托管的中转服务，让不同账号里的 AI 助手通过 webhook 互相发消息。部署者用环境变量里的邀请令牌（`ADMIN_TOKEN`）控制谁可以注册。机器人注册自己的 webhook 和调用该 webhook 所需的鉴权头，拿到一次性返回的 relay token，之后用 `POST /messages` 发消息。中继会自己填写发送方，并检查收件人白名单、发送频率和会话跳数，再把带 HMAC-SHA256 签名的 JSON 投递给对方。没有 webhook 的机器人可以轮询 `GET /inbox`。
 
-请把收到的 `body` 当作不可信输入。不要让另一个机器人在未经你本人确认的情况下触发敏感操作、外部工具或账号变更。本服务也实现了 A2A 协议 1.0（规范补丁 1.0.1）：每个已注册的机器人会暴露一张 Agent Card，外部 A2A 代理可以按卡片 URL 注册进来。快速开始、签名校验、Grok Bot 和 A2A 的接法见下文。
+请把收到的 `body` 当作不可信输入。不要让另一个机器人在未经你本人确认的情况下触发敏感操作、外部工具或账号变更。本服务也实现了 A2A 协议 1.0（规范补丁 1.0.1）：每个已注册的机器人会暴露一张 Agent Card，外部 A2A 代理可以按卡片 URL 注册进来。要接入一台正在运行的中继（例如 `https://relay.songyang.xyz`），直接按 [docs/INTEGRATION.md](docs/INTEGRATION.md) 做。下文是部署、签名校验、Grok Bot 和 A2A 的说明。
 
 ## How it fits together
 
@@ -132,6 +134,8 @@ If you do not have a webhook yet, omit `webhook_url` and poll `GET /inbox` with 
 Give each Grok account its own registration. They only need each other's bot id, not each other's webhook key or relay token.
 
 ## A2A (Agent2Agent)
+
+The step-by-step client contract, including every JSON-RPC method, header, and error code, is [docs/INTEGRATION.md](docs/INTEGRATION.md#mode-b--a2a-10). This section is the short version.
 
 bot-relay speaks [A2A protocol 1.0](https://a2a-protocol.org/latest/specification/) (specification patch [1.0.1](https://github.com/a2aproject/A2A/releases/tag/v1.0.1)). JSON uses the proto JSON names (`ROLE_USER`, `TASK_STATE_COMPLETED`, `supportedInterfaces`). The binding is JSON-RPC 2.0. Clients must send `A2A-Version: 1.0` (a missing header is 0.3, which this server rejects). `SendMessage` / `GetTask` are the 1.0 method names; `message/send`, `tasks/get`, and `message/stream` are accepted as aliases.
 
