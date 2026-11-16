@@ -239,6 +239,43 @@ export async function selectPinnedAddress(hostname: string, policy: Pick<PinPoli
   return chosen;
 }
 
+/**
+ * Read at most maxBytes of a response body, then cancel the stream so a
+ * hostile endpoint cannot drag the connection out (design §9.1).
+ */
+export async function readCappedBody(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+  const merged = chunks.length === 0 ? new Uint8Array() : concatChunks(chunks, Math.min(total, maxBytes));
+  return Buffer.from(merged).toString('utf8');
+}
+
+function concatChunks(chunks: Uint8Array[], limit: number): Uint8Array {
+  const out = new Uint8Array(limit);
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= limit) break;
+    const slice = chunk.subarray(0, limit - offset);
+    out.set(slice, offset);
+    offset += slice.byteLength;
+  }
+  return out;
+}
+
 function normalizeHeaders(headers: RequestInit['headers']): Record<string, string> {
   const out: Record<string, string> = {};
   if (!headers) return out;

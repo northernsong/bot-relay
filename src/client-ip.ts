@@ -91,3 +91,26 @@ function firstIp(value: string | undefined): string | null {
   const trimmed = value.trim();
   return isIP(trimmed) !== 0 ? trimmed : null;
 }
+
+/**
+ * Rate limit on an arbitrary key (bot id, pair, ...) using the shared
+ * `rate_hits` window counter (design §9.2).
+ */
+export function limitKey(
+  deps: Deps,
+  key: string,
+  max: number,
+  opts: { code?: string; windowMs?: number } = {},
+): void {
+  const windowMs = opts.windowMs ?? deps.config.rateLimitWindowSec * 1000;
+  const rate = deps.db.consumeRate(key, deps.now(), windowMs, max);
+  if (!rate.allowed) {
+    throw new HttpError(
+      429,
+      opts.code ?? 'rate_limited',
+      'Too many requests, try again later',
+      { 'retry-after': String(rate.retryAfterSec) },
+      { retry_after: rate.retryAfterSec },
+    );
+  }
+}

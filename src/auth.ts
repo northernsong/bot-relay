@@ -30,6 +30,8 @@ export function requireBot(deps: Deps, header: string | undefined): Bot {
   if (!bot || bot.tokenRevokedAt !== null) {
     throw new HttpError(401, 'unauthorized', 'Bot token required', { 'www-authenticate': 'Bearer' });
   }
+  // Last authenticated call, shown as "recent activity" in the admin console.
+  deps.db.touchBot(bot.id, deps.now());
   return bot;
 }
 

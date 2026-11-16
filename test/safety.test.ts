@@ -180,7 +180,7 @@ describe('pinnedFetch', () => {
     expect(hook.hits).toHaveLength(1);
   });
 
-  it('has no call sites outside ssrf.ts; outbound delivery arrives in phase B', () => {
+  it('has exactly one call site: the inquiry outbound delivery in inquiry.ts', () => {
     const srcDir = join(import.meta.dirname, '..', 'src');
     const offenders: string[] = [];
     const walk = (dir: string): void => {
@@ -193,7 +193,10 @@ describe('pinnedFetch', () => {
       }
     };
     walk(srcDir);
-    expect(offenders).toEqual([]);
+    expect(offenders).toEqual([join(srcDir, 'inquiry.ts')]);
+    // And within inquiry.ts the fetch happens once, in the delivery task.
+    const source = readFileSync(join(srcDir, 'inquiry.ts'), 'utf8');
+    expect(source.match(/pinnedFetch\(/g)?.length ?? 0).toBe(1);
   });
 });
 

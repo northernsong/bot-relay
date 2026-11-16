@@ -157,6 +157,26 @@ export async function startServer(app: Hono): Promise<{
   };
 }
 
+/** Fixed-by-default clock that a test can advance for expiry scenarios. */
+export function mutableClock(base = 1_700_000_000_000): { now: () => number; advance: (ms: number) => void } {
+  let at = base;
+  return {
+    now: () => at,
+    advance: (ms: number) => {
+      at += ms;
+    },
+  };
+}
+
+/** Poll until cond() is true (background delivery settles asynchronously). */
+export async function until(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 export async function startWebhook(opts?: { statuses?: number[]; hang?: boolean }): Promise<{
   url: string;
   hits: Array<{ body: string; headers: IncomingHttpHeaders }>;
