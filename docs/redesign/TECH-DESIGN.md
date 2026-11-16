@@ -1,8 +1,8 @@
-# bot-relay 重设计技术设计（初稿）：纯注册中心
+# bot-relay 重设计技术设计（第二稿）：纯注册中心
 
-> 状态：技术设计初稿，待 norther 审阅。依据定稿 PRD（`docs/redesign/PRD.md`，commit `993ba42`，决策 1–12 全部生效）与当前仓库代码（代码基线为 commit `07c6143`，自该提交起 `src/` 未再改动，即 HEAD `993ba42` 的现状代码）。本文回答「怎么做」：技术选型、数据模型、API、状态机、安全机制与实施计划，均为可开工粒度。
+> 状态：技术设计第二稿，待 norther 审阅。本文依据技术设计初稿（commit `b16dd37`）修订；初稿依据定稿 PRD（`docs/redesign/PRD.md`，commit `993ba42`，决策 1–12 全部生效）与当前仓库代码（代码基线为 commit `07c6143`，自该提交起 `src/` 未再改动）。norther 对初稿 3 条「待拍板」的答复已全部落地，整理为 §15「已确认决策」（决策 D1–D3），全文相关章节已按其改写。本文仍只回答「怎么做」：技术选型、数据模型、API、状态机、安全机制与实施计划，均为可开工粒度，不含大段业务代码。
 >
-> 范围约束（与 PRD 一致）：纯注册中心，不中转、不存储消息；联系方式经询问后授权下发，不做自动同意；本轮不做可达性探活；≤10 个 Bot；客户端仅考虑 Grok Bot 的接入现实；不兼容 0.1.0 / relay.songyang.xyz，升级 = 重新注册，不做数据迁移。
+> 范围约束（与 PRD 一致）：纯注册中心，不中转、不存储消息；联系方式经询问后授权下发，不做自动同意；本轮不做可达性探活；≤10 个 Bot；客户端仅考虑 Grok Bot 的接入现实；不兼容旧 0.1.0 实例（域名沿用 `relay.songyang.xyz`，见决策 D1/D2），升级 = 重新注册，不做数据迁移。
 
 ## 1. 设计目标与范围
 
@@ -15,6 +15,8 @@
 5. 凭证收敛到 3 种：部署者凭证（`ADMIN_TOKEN`）、Bot 访问令牌（`br_` 前缀）、邀请码（`inv_` 前缀）。Bot 自己的 webhook 鉴权头属登记资料，不算新增凭证。
 6. 单机轻量：TypeScript + Hono + SQLite（`node:sqlite`）+ 单进程 Node 22，延续现有栈，不换框架、不加运行时依赖（Ed25519/JWT 用 `node:crypto` 内建能力实现）。
 
+**为什么不用 Java 25**：继续用 TypeScript，不换 Java 25。①**复用现有代码**：本仓库已有可用的 TypeScript/Hono 控制面骨架（邀请、管理台、加密、SSRF、会话等），换 Java 等于放弃复用、几乎重写；②**内存占用**：目标是一台小机器上的轻量自托管服务，Node 单进程更符合这个体量，引入 JDK 25 会明显抬高常驻内存；③**规模**：前期不超过 10 个 Bot，全是控制面（注册、目录、询问授权、短时身份证明），没有消息中转吞吐压力，换栈没有性能收益。
+
 **优先级取舍**：
 
 | 级别 | 本设计的处理 |
@@ -25,6 +27,8 @@
 | P1-3 变更获知 | **纳入本轮**（阶段 B）：目录条目带 `updated_at` 与 `contact_version`；已授权方经受控刷新拿新资料，被撤销后刷新得到明确 410（写入 Agent 文档） |
 | P1-4 轮换产品化 | **纳入本轮**（阶段 C/D）：轮换步骤写入两份文档；管理台 Bot 列表显示最近令牌/密钥轮换时间；「撤销 + 一并轮换」作为撤销接口的选项 |
 | P2 全部 | 不做，仅保留 P2-4 探活、P2-1 更多客户端等条目在 PRD 中占位；本设计不为它们预留机制 |
+
+P1-1～P1-4 的范围已确认（决策 D3，§15）：**全部随本轮交付**，不存在「推迟 P1-2/P1-4 以更快发布」的选项。
 
 **非目标**：消息中转/收件箱/投递重试、A2A、自动同意、探活、多管理员、多租户、消息内容理解（PRD §4 非目标，逐条生效）。
 
@@ -50,7 +54,7 @@
 | `src/db.ts` | 部分复用 | `openDatabase`、事务、`rate_hits`、`invites` 系列保留；删除 `messages/idempotency_keys/delivery_attempts/a2a_tasks` 相关与启动 `requeueInFlight`、A2A 内建系统 Bot；新增 `inquiries/grants/registry_keys/kv/audit_events`（§4） |
 | `test/helpers.ts` | 复用 | `makeApp`（内存库+固定时钟）、`api`、`startWebhook`（本地 mock webhook，收请求、可控状态码）是接口测试基础 |
 | `Dockerfile` | 基本复用 | 多阶段构建、`node` 用户、`/health` healthcheck 不变 |
-| `docker-compose.yml`、`.env.example` | 修改对齐 | compose 改为 `env_file: .env` 整体透传（修 E3「进程不读 .env、compose 硬编码」）；`.env.example` 换成收敛后的配置集（§12.2） |
+| `docker-compose.yml`、`.env.example` | 修改对齐 | compose 改为 `env_file: .env` 整体透传（修 E3「进程不读 .env、compose 硬编码」），宿主侧端口仅回环发布 `127.0.0.1:8080:8080`（决策 D1，不对公网开端口）；`.env.example` 换成收敛后的配置集（§12.2） |
 
 ### 2.2 整模块删除
 
@@ -119,19 +123,23 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  subgraph Host["单机（VPS / 小服务器）"]
+  Client["部署者浏览器 / Bot 进程"] -->|"HTTPS https://relay.songyang.xyz"| CF["Cloudflare 边缘"]
+  subgraph Host["单机（VPS / 小服务器），不对公网开端口"]
+    TUN["cloudflared（本机）"]
     subgraph Proc["node dist/index.js（单进程）"]
-      H["Hono HTTP 服务<br/>业务面 /v1 + 管理面 /admin"]
+      H["Hono HTTP 服务（只监听 HOST=127.0.0.1:8080）<br/>业务面 /v1 + 管理面 /admin"]
       BG["后台任务：询问送达（即时、单次）<br/>清扫定时器（超时/卡死，60s）"]
     end
     SQLite[("./data/bot-relay.sqlite<br/>WAL 模式")]
     Env[".env（ADMIN_TOKEN、ENCRYPTION_KEY 等）"]
   end
-  Client["部署者浏览器 / Bot 进程"] -->|"HTTPS（反代终结，可选）"| H
+  CF -->|"Cloudflare Tunnel（加密）"| TUN
+  TUN -->|"http://127.0.0.1:8080（回环，唯一入口）"| H
   H --> SQLite
   Proc --> Env
 ```
 
+- **接入形态（决策 D1）**：域名沿用 `relay.songyang.xyz`，公网唯一入口是 Cloudflare Tunnel；服务只监听回环 `127.0.0.1:8080`，由本机 cloudflared 直连该地址，前面不加 Caddy/nginx，也不对公网开任何端口。`TRUSTED_PROXIES` 只信任本机 tunnel 客户端（`127.0.0.1/32`，必要时含 `::1/128`），客户端 IP 取 `CF-Connecting-IP`（§9.2）。本图是目标形态设计，不构成对现有 Tunnel/cloudflared、防火墙或运行中 0.1.0 服务的任何变更动作（切换见 §12.1）。
 - 单进程内完成全部控制面工作；「后台送达」是进程内的异步任务（受理后立即调度，限时 10s），不是常驻消息队列——系统中没有在途消息。
 - 崩溃重启的影响面：`delivering` 状态的询问在启动清扫时记为「未送达」（§6.3）；已确认的注册、授权关系、询问状态全部持久化在 SQLite。
 
@@ -427,11 +435,11 @@ sequenceDiagram
 // header
 {"alg":"EdDSA","typ":"JWT","kid":"rk_2026a"}
 // claims
-{"iss":"https://relay.example.com","sub":"alice","name":"Alice",
+{"iss":"https://relay.songyang.xyz","sub":"alice","name":"Alice",
  "iat":1763000000,"exp":1763000300,"jti":"jti_…"}
 ```
 
-- `iss` = `PUBLIC_BASE_URL`（注册中心对外 origin）；`sub` = 调用方 Bot id（稳定 id，P0-7①）；`name` = 签发时显示名快照；`exp - iat = IDENTITY_TOKEN_TTL_SEC`，**默认与上限均 300s**（P0-7②）。
+- `iss` = `PUBLIC_BASE_URL`（注册中心对外 origin，本实例默认写死 `https://relay.songyang.xyz`，决策 D1）；`sub` = 调用方 Bot id（稳定 id，P0-7①）；`name` = 签发时显示名快照；`exp - iat = IDENTITY_TOKEN_TTL_SEC`，**默认与上限均 300s**（P0-7②）。
 - 签发：`POST /v1/identity-token`（A 的访问令牌换 JWT），被停用 Bot 拒绝签发。
 
 ### 7.3 被调方（B）的校验流程（写入 Agent 接入文档，P0-7③）
@@ -471,7 +479,7 @@ sequenceDiagram
 
 ### 9.2 限流与来源识别
 
-- **来源识别（修 N8，替代 `TRUST_PROXY` 布尔开关）**：新增 `TRUSTED_PROXIES`（CIDR 列表，默认空）。仅当 TCP 对端地址命中该列表时，才取 `CF-Connecting-IP` / `X-Forwarded-For` 最右侧可信跳作为来源 IP；否则一律用 socket 地址。默认「不信任任何代理头」——伪造头无效；反代场景把其内网网段（如 `172.16.0.0/12`）写入配置。管理面与业务面共用同一来源识别，不再有「全有或全无」；同时删除 Cloudflare Access 邮箱旁路（§2.1）。
+- **来源识别（修 N8，替代 `TRUST_PROXY` 布尔开关；取值按决策 D1 拍定）**：新增 `TRUSTED_PROXIES`（CIDR 列表，本实例默认与推荐值 `127.0.0.1/32,::1/128`——只信任本机 cloudflared 这一个代理）。客户端 IP 一律取 `CF-Connecting-IP`，但**仅当 TCP 对端地址命中 `TRUSTED_PROXIES` 时才采信该头**；对端未命中信任列表时一律用 socket 地址，并忽略 `CF-Connecting-IP`、`X-Forwarded-For` 等一切代理头——伪造头无效。（本实例 `HOST=127.0.0.1`，能出现在回环上的只有本机 cloudflared 与部署者本机进程，后者伪造头属可接受信任面。）「`X-Forwarded-For` 最右侧跳」仅作为其它部署形态（多级自管反代）的兼容备注，本实例默认且推荐的方案是 **`CF-Connecting-IP` + 只信任本机 cloudflared**。管理面与业务面共用同一来源识别，不再有「全有或全无」；同时删除 Cloudflare Access 邮箱旁路（§2.1）。
 - **限流口径**（`rate_hits` 窗口计数，窗口 60s，均可配置）：
 
 | 场景 | 键 | 默认额度 |
@@ -486,7 +494,7 @@ sequenceDiagram
 | 目录查询 | Bot id | 60/min |
 | 询问出站送达 | 目标 Bot id | 20/hour（配合无重试策略的兜底） |
 
-- 超额统一 `429 rate_limited` + `retry_after`；来源 IP 计数在无代理信任时共享 `direct` 桶（默认部署绑定 127.0.0.1/反代后，行为正确，见 §12）。
+- 超额统一 `429 rate_limited` + `retry_after`。按来源 IP 计数的场景（注册、管理登录）在本实例的口径：经 cloudflared 进来的请求对端命中 `TRUSTED_PROXIES`，按 `CF-Connecting-IP`（真实客户端 IP）分桶；部署者从本机直连回环的请求没有该头，按 socket 地址（127.0.0.1）共享一个桶，两者互不挤占（§12.1、决策 D1）。
 
 ## 10. 管理台
 
@@ -509,18 +517,19 @@ sequenceDiagram
 
 ## 12. 部署方式（仅设计，不实施）
 
-### 12.1 目标形态
+### 12.1 目标形态（接入按决策 D1，退役按决策 D2）
 
 - **一条命令**：`docker compose up -d --build`（推荐）；或裸机 `node --env-file=.env dist/index.js`（Node 22 原生读 `.env`，修 E3「进程不读 .env」）。
-- **必要秘密**：`ADMIN_TOKEN`、`ENCRYPTION_KEY`（必填，生成命令写进 `.env.example` 与文档）；`PUBLIC_BASE_URL` 必填（身份证明 `iss`、邀请注册链接都依赖它）。
-- **compose 修正**：服务定义改为 `env_file: .env` 整体透传（新增配置自动生效，不再逐项硬编码映射）；容器端口固定 8080，宿主侧 `${PORT:-8080}:8080`；数据卷挂 `/data`（SQLite WAL 三件套）；healthcheck 沿用 `/health`。
-- **管理面信任边界**：默认绑定 `HOST=0.0.0.0` 但管理台仅靠登录（限流 + 会话）；推荐部署为「反代（HTTPS）在前、`TRUSTED_PROXIES` 只填反代网段」，或管理面只经 SSH 隧道访问（`HOST=127.0.0.1`）——两种形态写入文档（P0-10③）。
+- **接入形态（决策 D1）**：域名继续用 `relay.songyang.xyz`（不切新域名）；公网唯一入口是 Cloudflare Tunnel——由本机 cloudflared 把 `https://relay.songyang.xyz` 回源到 `http://127.0.0.1:8080`。服务**只监听 `HOST=127.0.0.1`**，不对公网开任何端口，前面不加 Caddy/nginx，也不需要额外反代层。本节仅描述目标形态，不构成对现有 cloudflared/Tunnel、防火墙或运行中 0.1.0 服务的任何变更动作。
+- **必要秘密**：`ADMIN_TOKEN`、`ENCRYPTION_KEY`（必填，生成命令写进 `.env.example` 与文档）；`PUBLIC_BASE_URL` 必填（身份证明 `iss`、邀请注册链接都依赖它），本实例与全部文档示例写死 `https://relay.songyang.xyz`。接入恒为 HTTPS（Cloudflare 终结），管理台会话 Cookie 一律带 `Secure`。
+- **compose 修正**：服务定义改为 `env_file: .env` 整体透传（新增配置自动生效，不再逐项硬编码映射）；容器内端口固定 8080，宿主侧**仅回环发布** `127.0.0.1:8080:8080` 供本机 cloudflared 回源（不写 `${PORT:-8080}:8080` 这类对公网暴露的映射，也不绑定 `0.0.0.0`）；数据卷挂 `/data`（SQLite WAL 三件套）；healthcheck 沿用 `/health`。裸机形态更简单：进程直接 `HOST=127.0.0.1` 监听回环，无需任何端口发布。
+- **管理面信任边界**：管理台与业务面同一入口（公网 → Cloudflare Tunnel → 本机回环），`TRUSTED_PROXIES` 填 `127.0.0.1/32`（必要时加 `::1/128`，§9.2）；登录（限流 + 会话）+ CSRF 是第二道防线（P0-10③）。SSH 隧道仅作为排障备注（绕过 Tunnel 直连回环调试时仍受同一登录/限流保护），不是本实例的默认形态。
 - **备份与恢复**：备份 = 数据卷（或 `data/` 目录）+ `.env`（`ENCRYPTION_KEY` 丢失 = 联系方式与私钥永久不可解密，文档显著声明）；恢复 = 换回数据目录与同 `.env` 启动，授权关系随注册数据一并恢复（PRD 可靠性）。
-- **不兼容声明**：不兼容 0.1.0 / relay.songyang.xyz（决策 5）；升级路径 = 新库新部署，所有 Bot 凭新邀请码重新注册；旧实例处置见「待拍板 2」。
+- **不兼容声明与旧实例退役（决策 D2；PRD 决策 5）**：不兼容旧 0.1.0 实例；升级路径 = 新库新部署，所有 Bot 凭新邀请码重新注册。切换日**直接停掉旧 0.1.0 实例，换成新版**——不留「拒绝并提示重新注册」公告窗口，不做新旧并存；域名与「Tunnel → 本机回环」的入口形态保持不变，重新注册的告知由部署者经自有渠道完成。
 
 ### 12.2 配置项（`.env.example` 目标集）
 
-保留/改名：`PORT`、`HOST`、`DATABASE_PATH`、`ADMIN_TOKEN`、`ENCRYPTION_KEY`（改必填）、`PUBLIC_BASE_URL`（改必填）、`TRUSTED_PROXIES`（新增，CIDR 逗号分隔，替代 `TRUST_PROXY`）、`ADMIN_SESSION_TTL_SEC`、`ALLOW_HTTP_WEBHOOKS`、`ALLOW_PRIVATE_WEBHOOKS`（默认 false，仅本地测试）、`RATE_LIMIT_WINDOW_SEC`。
+保留/改名：`PORT`、`HOST`（默认 `127.0.0.1`，只监听回环、不对公网开端口，决策 D1）、`DATABASE_PATH`、`ADMIN_TOKEN`、`ENCRYPTION_KEY`（改必填）、`PUBLIC_BASE_URL`（改必填；本实例与示例均 `https://relay.songyang.xyz`，决策 D1）、`TRUSTED_PROXIES`（新增，CIDR 逗号分隔，替代 `TRUST_PROXY`；默认与推荐值 `127.0.0.1/32,::1/128`，即只信任本机 cloudflared）、`ADMIN_SESSION_TTL_SEC`、`ALLOW_HTTP_WEBHOOKS`、`ALLOW_PRIVATE_WEBHOOKS`（默认 false，仅本地测试）、`RATE_LIMIT_WINDOW_SEC`。
 新增：`INQUIRY_TTL_SEC`（默认 86400）、`INQUIRY_DELIVERY_TIMEOUT_MS`（默认 10000）、`IDENTITY_TOKEN_TTL_SEC`（默认 300，上限 300）、各限流额度覆盖项（`REGISTER_RATE_PER_MIN`、`LOGIN_RATE_PER_MIN`、`INQUIRY_RATE_PER_MIN`、`INQUIRY_PAIR_RATE_PER_HOUR`、`DEFAULT_RATE_PER_MIN`）。
 删除：`RELAY_SECRET`、`MAX_HOPS`、`DELIVERY_*`、`BODY_MAX_CHARS`、`METADATA_MAX_CHARS`、`SIGNATURE_TOLERANCE_SEC`、`IDEMPOTENCY_TTL_SEC`、`A2A_*`、`TRUST_PROXY`、`AUTH_RATE_LIMIT_MAX`。
 
@@ -536,7 +545,7 @@ sequenceDiagram
 | 互调鉴权 | JWT 签发/验签/过期/错 `iss`/错 `kid`；停用后拒签发；停用后存量 JWT 在窗口内离线仍验签通过、在线 verify 返回 disabled；JWKS 含退休窗口旧钥；询问报文签名可被公钥验证、篡改/重放（超时容差外）被拒 | 单测（`node:crypto` 直接验签）+ 接口测试 |
 | SSRF | BlockList 全段逐条（含新增 240/4、2002::/16）；解析失败拒绝；`pinnedFetch` 不跟随 3xx、钉 IP（mock DNS 重绑定场景）；出站响应体上限 | 单测 + `startWebhook` |
 | 加密与脱敏 | 密文落库（直读 DB 断言无明文）；日志 spy 断言无令牌/密钥/JWT、URL 只有 host；管理台常规列表与审计 detail 无密钥 | 单测 + 接口测试 |
-| 管理台权限 | 未登录 401、CSRF 缺失 403、登录限流 429；停用/启用/删除级联（授权关系同删）；credentials 需会话+CSRF 且记审计；`TRUSTED_PROXIES` 逐跳来源识别（伪造头在未信任时无效、信任时生效） | 接口测试 |
+| 管理台权限 | 未登录 401、CSRF 缺失 403、登录限流 429；停用/启用/删除级联（授权关系同删）；credentials 需会话+CSRF 且记审计；`TRUSTED_PROXIES` 来源识别：对端命中 `127.0.0.1/32` 时采信 `CF-Connecting-IP`，未信任对端的伪造 `CF-Connecting-IP`/`X-Forwarded-For` 无效、回退 socket 地址 | 接口测试 |
 | 旧测试 | `test/a2a.test.ts`、`test/messages.test.ts`、`test/sign.test.ts` 删除；`safety/hardening/register` 重写保留 SSRF/限流/邀请断言 | — |
 
 类型检查 `npm run typecheck` 与 `npm run test` 全绿是每个阶段的完成条件之一（§14）。
@@ -548,12 +557,18 @@ sequenceDiagram
 | **A 砍除与骨架** | 删 `src/a2a/`、`delivery/send/envelope/sign`、消息/A2A 表与路由、旧测试与文档中相应章节；`db.ts` 换新 schema；`secret.ts` 单密钥版本；`config.ts` 收敛 | 可启动的空注册中心 | typecheck+测试绿；`/health` 200；代码中无消息/A2A 路径；`pinnedFetch` 无调用点（唯一出站点在阶段 B 加入） |
 | **B 注册 + 目录 + 询问授权（P0 核心）** | `bots/invites` 全流程、`/v1/register`+`/register` 页、`/v1/me`、目录、`inquiries/grants` 表与状态机、后台送达与清扫、`inquiry`/`grants` 模块、`intake` 三态、管理台最小集 | 可用的注册中心 | PRD P0-1~P0-5、P0-9 验收标准全过（§13 对应测试）；两 Bot 端到端演练：注册→查目录→询问→同意→拿到联系方式 |
 | **C 互调鉴权 + 轮换 + 安全基线** | `identity.ts`（Ed25519/JWT/JWKS）、identity-token/verify/bots/:id/status、询问报文签名、令牌轮换/作废、webhook 密钥轮换与受控刷新收紧、`TRUSTED_PROXIES`、全部限流、credentials 视图 | 安全闭环的注册中心 | PRD P0-6~P0-8、P0-10 验收标准全过；停用窗口 ≤5 分钟有测试证明 |
-| **D 文档 + 可观测 + P1** | `docs/AGENT_GUIDE.md`（A/B 两侧接入，含可复制示例与错误语义）、`docs/OVERVIEW.md`（百行级给人看的说明）、`/metrics`、`audit_events` + 管理台审计视图、P1-2 向导页、P1-3 目录 `updated_at`/`contact_version`、P1-4 轮换可见、README 重写、`.env.example`/compose 对齐 | 定稿文档与可观测 | PRD P0-11、P0-12 验收；P1-1~P1-4 验收；按 PRD 成功指标演练「Agent 读完一份文档自主接入」 |
+| **D 文档 + 可观测 + P1（全部纳入）** | P1-1～P1-4 **全部**随本阶段交付（决策 D3，无推迟选项）：`docs/AGENT_GUIDE.md`（A/B 两侧接入，含可复制示例与错误语义）、`docs/OVERVIEW.md`（百行级给人看的说明）、`/metrics`、`audit_events` + 管理台审计视图（P1-1）、P1-2 向导页、P1-3 目录 `updated_at`/`contact_version`、P1-4 轮换可见、README 重写、`.env.example`/compose 对齐 | 定稿文档与可观测 | PRD P0-11、P0-12 验收；P1-1~P1-4 验收；按 PRD 成功指标演练「Agent 读完一份文档自主接入」 |
 
 每阶段一次独立可评审的提交序列；阶段 B 结束即可邀请真实 Grok Bot 试用（缺互调鉴权的 C 能力时先以「信任 webhook 鉴权头」过渡，不对外承诺）。本设计阶段不写任何实现代码。
 
-## 15. 待拍板
+## 15. 已确认决策（norther 对初稿「待拍板」的答复）
 
-1. **对外域名与接入形态**：新实现继续用 `relay.songyang.xyz` 还是启用新域名？前置反代是 Cloudflare Tunnel 还是本机 nginx/Caddy（或裸暴露 + DNS）？影响 `PUBLIC_BASE_URL`/JWT `iss`、`TRUSTED_PROXIES` 推荐值、Cookie `Secure` 与两份新文档的全部示例。
-2. **旧 0.1.0 实例退役节奏**：切换日直接停机，还是保留一段时间的「拒绝并提示重新注册」公告窗口？影响迁移公告文案与新旧实例并存的时长。
-3. **P1 范围确认**：本稿默认 P1-1~P1-4 全部随本轮交付（增量小，见 §14 阶段 D）；若想更快发布 P0，可推迟 P1-2（向导页）与 P1-4（轮换可见），请确认取舍。
+初稿遗留的 3 条「待拍板」已由 norther 答复并确认，编号 **D1–D3**（区别于 PRD 的决策 1–12），全文相关章节已按其改写：
+
+- **D1 域名与接入形态**：继续用现有域名 `relay.songyang.xyz`，不切新域名；入口继续用 Cloudflare Tunnel（cloudflared）。服务只监听 `127.0.0.1`（`HOST=127.0.0.1`），不对公网开端口，前面不加 Caddy/nginx——Tunnel 连到本机回环地址即可，无需再暴露或额外反代一层。`TRUSTED_PROXIES` 按「只有本机 cloudflared」设置：`127.0.0.1/32`（必要时加 `::1/128`）；客户端 IP 取 `CF-Connecting-IP`，且仅当请求确实来自该受信代理时才采信，未信任来源一律用 socket 地址、忽略伪造头（§9.2）。`PUBLIC_BASE_URL`、JWT `iss`、Cookie `Secure` 与全部文档示例默认写死 `https://relay.songyang.xyz`（§3.2、§7.2、§12）。
+- **D2 旧 0.1.0 实例退役**：切换日直接停掉旧的 0.1.0 实例，换成新版；不留「拒绝并提示重新注册」公告窗口，也不做新旧并存。仍声明不兼容、所有人重新注册，只是没有过渡公告期（§12.1）。
+- **D3 P1 范围**：P1-1～P1-4 全部在本轮交付（§1 优先级取舍、§14 阶段 D），不再提供「可推迟 P1-2/P1-4」的选项。
+
+## 16. 仍待确认
+
+本稿已无待拍板项：初稿 3 条均已在 §15 确认，其余技术选型与参数均可在本设计内自行拍定，暂无会影响实现方向的新问题。
