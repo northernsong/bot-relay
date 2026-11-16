@@ -4,6 +4,7 @@ import { requireActiveBot, requireBot } from './auth.js';
 import { limitAuth, limitKey } from './client-ip.js';
 import type { Deps } from './deps.js';
 import { HttpError, isUniqueConstraint } from './errors.js';
+import { buildJwks, issueIdentityToken, verifyIdentityToken } from './identity.js';
 import { decryptSecret, encryptSecret, hashToken, newToken } from './secret.js';
 import { assertWebhookUrl } from './ssrf.js';
 import type { Bot, BotPatch, Inquiry, InquiryStatus } from './types.js';
@@ -34,6 +35,54 @@ export function registerV1Routes(app: Hono, deps: Deps): void {
   registerDirectoryRoutes(app, deps);
   registerInquiryRoutes(app, deps);
   registerGrantRoutes(app, deps);
+  registerIdentityRoutes(app, deps);
+}
+
+/** Inter-bot authentication surface (design §5.6, §7). */
+function registerIdentityRoutes(app: Hono, deps: Deps): void {
+  // Disabled bots get no new proofs (§7.4): stop issuing at the door.
+  app.post('/v1/identity-token', (c) => {
+    const bot = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `identity:${bot.id}`, deps.config.mutationRatePerMin);
+    const issued = issueIdentityToken(deps, bot);
+    return c.json({ token: issued.token, expires_at: iso(issued.expiresAt) });
+  });
+
+  // Online confirmation channel (§7.3 step 3): signature + expiry + status.
+  app.post('/v1/identity/verify', async (c) => {
+    const caller = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `verify:${caller.id}`, deps.config.defaultRatePerMin);
+    const body = await readJsonObject(c);
+    rejectUnknown(body, ['token']);
+    if (typeof body.token !== 'string' || body.token.trim() === '') {
+      throw new HttpError(401, 'invalid_token', 'Provide the JWT string in the "token" field');
+    }
+    const result = verifyIdentityToken(body.token, {
+      jwks: buildJwks(deps),
+      iss: deps.config.publicBaseUrl,
+      now: deps.now(),
+    });
+    if (!result.valid) {
+      throw new HttpError(401, 'invalid_token', `The identity token is invalid (${result.reason})`, undefined, {
+        reason: result.reason,
+      });
+    }
+    const subject = deps.db.getBot(result.claims.sub);
+    if (!subject) {
+      // Signed proof of a bot that no longer exists: report it as gone.
+      return c.json({ valid: false, id: result.claims.sub, display_name: null, disabled: true });
+    }
+    return c.json({ valid: !subject.disabled, id: subject.id, display_name: subject.displayName, disabled: subject.disabled });
+  });
+
+  // Real-time status lookup for the online revocation check (P0-7②).
+  app.get('/v1/bots/:id/status', (c) => {
+    const caller = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `status:${caller.id}`, deps.config.defaultRatePerMin);
+    const target = deps.db.getBot(c.req.param('id') ?? '');
+    if (!target) throw new HttpError(404, 'not_found', 'No such bot');
+    return c.json({ id: target.id, display_name: target.displayName, disabled: target.disabled });
+  });
 }
 
 /**
@@ -235,7 +284,7 @@ function registerInquiryRoutes(app: Hono, deps: Deps): void {
 
   app.post('/v1/inquiries/:id/decision', async (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
-    limitKey(deps, `decision:${bot.id}`, deps.config.defaultRatePerMin);
+    limitKey(deps, `decision:${bot.id}`, deps.config.mutationRatePerMin);
     const body = await readJsonObject(c);
     rejectUnknown(body, ['decision']);
     const inquiry = decideInquiry(deps, bot, c.req.param('id') ?? '', body.decision);
@@ -255,14 +304,14 @@ function registerGrantRoutes(app: Hono, deps: Deps): void {
 
   app.get('/v1/grants/:id/contact', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
-    limitKey(deps, `refresh:${bot.id}`, deps.config.defaultRatePerMin);
+    limitKey(deps, `refresh:${bot.id}`, deps.config.mutationRatePerMin);
     const { grant_id, contact } = refreshGrantContact(deps, bot, c.req.param('id') ?? '');
     return c.json({ grant_id, ...contact });
   });
 
   app.post('/v1/grants/:id/abandon', async (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
-    limitKey(deps, `abandon:${bot.id}`, deps.config.defaultRatePerMin);
+    limitKey(deps, `abandon:${bot.id}`, deps.config.mutationRatePerMin);
     const body = await readOptionalJsonObject(c);
     rejectUnknown(body, []);
     abandonGrant(deps, bot, c.req.param('id') ?? '');
@@ -271,7 +320,7 @@ function registerGrantRoutes(app: Hono, deps: Deps): void {
 
   app.post('/v1/grants/:id/revoke', async (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
-    limitKey(deps, `revoke:${bot.id}`, deps.config.defaultRatePerMin);
+    limitKey(deps, `revoke:${bot.id}`, deps.config.mutationRatePerMin);
     const body = await readOptionalJsonObject(c);
     rejectUnknown(body, ['rotate_webhook_secret']);
     const rotate =

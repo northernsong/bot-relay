@@ -1,8 +1,10 @@
 import type { Deps } from './deps.js';
 import { HttpError } from './errors.js';
 import { newInquiryId } from './ids.js';
+import { signInquiryPayload } from './identity.js';
 import { buildContact, upsertGrantOnApproval, type ContactPayload } from './grants.js';
 import { decryptSecret } from './secret.js';
+import { redactLogLine } from './redact.js';
 import { BlockedAddressError, pinnedFetch, readCappedBody } from './ssrf.js';
 import type { Bot, Inquiry, InquiryStatus } from './types.js';
 import { iso } from './http.js';
@@ -172,7 +174,9 @@ function scheduleDelivery(deps: Deps, inquiryId: string): void {
 /**
  * The single outbound call site of the whole service: one POST of the inquiry
  * to the target's webhook, pinned, no redirects, no retry (design §6, §9.1).
- * The Ed25519 X-Bot-Relay-Signature header is added in phase C.
+ * The body is signed with the registry Ed25519 key so B can prove the
+ * inquiry really came from the registry (§6.3, P0-5⑦); no symmetric secret
+ * is ever shared with the receiver.
  */
 async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
   try {
@@ -201,13 +205,18 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
       created_at: iso(inquiry.createdAt),
       expires_at: iso(inquiry.expiresAt),
     });
+    const signature = signInquiryPayload(deps, payload);
     let response: Response;
     try {
       response = await pinnedFetch(
         url,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'user-agent': `bot-relay/${VERSION}` },
+          headers: {
+            'content-type': 'application/json',
+            'user-agent': `bot-relay/${VERSION}`,
+            'x-bot-relay-signature': signature,
+          },
           body: payload,
         },
         {
@@ -239,7 +248,7 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
         level: 'error',
         msg: 'inquiry_delivery_failed',
         inquiry_id: inquiryId,
-        error: err instanceof Error ? err.message : 'error',
+        error: redactLogLine(err instanceof Error ? err.message : 'error'),
       }),
     );
   }

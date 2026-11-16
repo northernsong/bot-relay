@@ -4,10 +4,17 @@ import { registerV1Routes } from './api.js';
 import { registerAdminRoutes } from './admin/routes.js';
 import type { Deps } from './deps.js';
 import { HttpError } from './errors.js';
+import { buildJwks, ensureSigningKey } from './identity.js';
+import { redactLogLine } from './redact.js';
 import { VERSION } from './version.js';
 
 export function createApp(deps: Deps): Hono {
   const app = new Hono();
+
+  // First start generates the Ed25519 signing key pair (§7.1): the private
+  // half is encrypted at rest right away, the public half only ever leaves
+  // through the JWKS endpoint. Every later signature reuses this key.
+  ensureSigningKey(deps);
 
   app.use('*', async (c, next) => {
     await next();
@@ -35,7 +42,7 @@ export function createApp(deps: Deps): Hono {
       return c.json({ error: { code: err.code, message: err.message, ...err.extra } }, err.status);
     }
     const message = err instanceof Error ? err.message : 'error';
-    console.error(JSON.stringify({ level: 'error', msg: 'unhandled', error: message }));
+    console.error(JSON.stringify({ level: 'error', msg: 'unhandled', error: redactLogLine(message) }));
     return c.json({ error: { code: 'internal', message: 'Internal error' } }, 500);
   });
 
@@ -48,6 +55,13 @@ export function createApp(deps: Deps): Hono {
       return c.json({ ok: false, version: VERSION, db: 'error' }, 503);
     }
     return c.json({ ok: true, version: VERSION, db: 'ok' });
+  });
+
+  // Public verification key set for both JWT and inquiry payload signatures
+  // (design §5.1, §7.3). Short caching keeps rotation visible within minutes.
+  app.get('/.well-known/bot-relay/jwks.json', (c) => {
+    c.header('Cache-Control', 'public, max-age=300');
+    return c.json(buildJwks(deps));
   });
 
   registerV1Routes(app, deps);

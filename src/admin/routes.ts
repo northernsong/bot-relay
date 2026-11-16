@@ -3,10 +3,11 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Context, Hono } from 'hono';
 
 import { isAdminBearer } from '../auth.js';
-import { limitAuth, requestIsHttps } from '../client-ip.js';
+import { clientIp, limitAuth, requestIsHttps } from '../client-ip.js';
 import type { Deps } from '../deps.js';
 import { HttpError } from '../errors.js';
-import { hashToken } from '../secret.js';
+import { rotateRegistryKey } from '../identity.js';
+import { decryptSecret, hashToken } from '../secret.js';
 import type { Bot } from '../types.js';
 import { ADMIN_COOKIE, createSession, readCookie, readSession, signSession } from '../session.js';
 import { adminCss, adminJs, dashboardPage, loginPage, registerJs, registerPage } from './pages.js';
@@ -58,6 +59,44 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
     return c.json({ bots });
   });
 
+  // Deliberate action with the widest secret exposure in the system (P0-6④):
+  // a logged-in session AND its CSRF token are both mandatory, the bearer
+  // token alone never unlocks decrypted contact details. Audited every time.
+  app.get('/admin/api/bots/:id/credentials', async (c) => {
+    const session = requireSession(c, deps);
+    await assertCsrf(c, session);
+    const id = c.req.param('id') ?? '';
+    const bot = deps.db.getBot(id);
+    if (!bot) throw new HttpError(404, 'not_found', 'Bot not found');
+    deps.db.insertAudit({
+      at: deps.now(),
+      actor: 'admin',
+      action: 'credentials.viewed',
+      object: bot.id,
+      // Field names only — never the decrypted values themselves (§4.1, §10.3).
+      detail: JSON.stringify({ fields: ['webhook_url', 'webhook_auth_name', 'webhook_auth_value'] }),
+      source: clientIp(c, deps.config.trustedProxies),
+    });
+    return c.json({
+      bot: {
+        id: bot.id,
+        display_name: bot.displayName,
+        webhook_url: decryptSecret(bot.webhookUrlEnc, deps.config.encryptionKey),
+        webhook_auth_name: bot.webhookAuthName === '' ? null : bot.webhookAuthName,
+        webhook_auth_value:
+          bot.webhookAuthValueEnc === '' ? null : decryptSecret(bot.webhookAuthValueEnc, deps.config.encryptionKey),
+        contact_version: bot.contactVersion,
+      },
+    });
+  });
+
+  // Registry signing key rotation (§7.4): the old public key stays in the
+  // JWKS for the 1h retirement window, so outstanding tokens keep verifying.
+  app.post('/admin/api/registry-keys/rotate', async (c) => {
+    await requireAdminAccess(c, deps, true);
+    return c.json(rotateRegistryKey(deps));
+  });
+
   app.post('/admin/api/bots/:id/disable', async (c) => {
     await requireAdminAccess(c, deps, true);
     return setDisabled(c, deps, true);
@@ -72,6 +111,14 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
     await requireAdminAccess(c, deps, true);
     const id = c.req.param('id') ?? '';
     if (!deps.db.deleteBot(id)) throw new HttpError(404, 'not_found', 'Bot not found');
+    deps.db.insertAudit({
+      at: deps.now(),
+      actor: 'admin',
+      action: 'bot.deleted',
+      object: id,
+      detail: null,
+      source: clientIp(c, deps.config.trustedProxies),
+    });
     return c.json({ deleted: true, id });
   });
 
@@ -162,7 +209,16 @@ function setDisabled(c: Context, deps: Deps, disabled: boolean) {
   const id = c.req.param('id') ?? '';
   const bot = deps.db.getBot(id);
   if (!bot) throw new HttpError(404, 'not_found', 'Bot not found');
-  deps.db.updateBot(id, { disabled }, deps.now());
+  const now = deps.now();
+  deps.db.updateBot(id, { disabled }, now);
+  deps.db.insertAudit({
+    at: now,
+    actor: 'admin',
+    action: disabled ? 'bot.disabled' : 'bot.enabled',
+    object: id,
+    detail: null,
+    source: clientIp(c, deps.config.trustedProxies),
+  });
   return c.json({ id, disabled });
 }
 

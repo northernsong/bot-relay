@@ -38,6 +38,7 @@ export function baseConfig(overrides: Partial<Config> = {}): Config {
     loginRatePerMin: 100,
     inquiryRatePerMin: 100,
     inquiryPairRatePerHour: 100,
+    mutationRatePerMin: 100,
     defaultRatePerMin: 100,
     ...overrides,
     databasePath: ':memory:',

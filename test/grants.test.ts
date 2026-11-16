@@ -216,7 +216,7 @@ describe('access control and rate limits', () => {
   });
 
   it('enforces the refresh rate budget', async () => {
-    const world = await makeWorld({ defaultRatePerMin: 1 });
+    const world = await makeWorld({ mutationRatePerMin: 1 });
     open.push({ close: async () => { await world.hook.close(); world.deps.db.close(); } });
     const grantId = await approvePair(world);
     expectStatus(await contact(world, grantId), 200);

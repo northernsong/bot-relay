@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { redactLogLine } from '../src/redact.js';
 import { decryptSecret, encryptSecret, newToken } from '../src/secret.js';
 import { ADMIN, api, createInvite, expectStatus, login, makeApp, registerBot, startServer } from './helpers.js';
 
@@ -252,6 +253,45 @@ describe('source identification', () => {
     expect(secure.headers.get('set-cookie')).toMatch(/Secure/);
     expect(secure.headers.get('set-cookie')).toMatch(/HttpOnly/);
     expect(secure.headers.get('set-cookie')).toMatch(/SameSite=Strict/);
+  });
+});
+
+describe('log redaction (§11)', () => {
+  const dirty =
+    'failed https://hooks.example.com/secret/path?k=1 token=br_secrettokenvalue invite=inv_invitecode123456 jwt=eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJib2IifQ.c2lnbmF0dXJl';
+
+  it('scrubs tokens, invite codes, JWTs, and reduces URLs to their host', () => {
+    const clean = redactLogLine(dirty);
+    expect(clean).toContain('https://hooks.example.com/[redacted]');
+    expect(clean).not.toContain('/secret/path');
+    expect(clean).not.toContain('br_secrettokenvalue');
+    expect(clean).not.toContain('inv_invitecode123456');
+    expect(clean).not.toContain('eyJhbGciOiJFZERTQSJ9');
+    expect(redactLogLine('nothing to scrub here')).toBe('nothing to scrub here');
+  });
+
+  it('routes unexpected handler errors through the redactor before stdout', async () => {
+    const { app, deps } = makeApp();
+    open.push({ close: () => deps.db.close() });
+    const session = await login(app);
+    const invite = await createInvite(app, session);
+    const alice = await registerBot(app, { id: 'alice', invite: invite.code });
+
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(deps.db, 'getBot').mockImplementation(() => {
+      throw new Error(`boom ${dirty}`);
+    });
+    try {
+      const res = await api(app, '/v1/directory/alice', { token: alice });
+      expectStatus(res, 500);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    const logged = spy.mock.calls.map((call) => call.join(' ')).join('\n');
+    expect(logged).toContain('https://hooks.example.com/[redacted]');
+    expect(logged).not.toContain('br_secrettokenvalue');
+    expect(logged).not.toContain('inv_invitecode123456');
+    expect(logged).not.toContain('eyJhbGciOiJFZERTQSJ9');
   });
 });
 

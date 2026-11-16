@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import type { Bot, BotPatch, Grant, Inquiry, InquiryStatus, Invite, NewBot } from './types.js';
+import type { AuditEvent, Bot, BotPatch, Grant, Inquiry, InquiryStatus, Invite, NewBot, RegistryKey } from './types.js';
 
 /**
  * Fresh schema for the pure registry (design §4). There is no message, task,
@@ -151,6 +151,24 @@ type RawGrant = {
   refreshed_contact_version: number | null;
 };
 
+type RawRegistryKey = {
+  kid: string;
+  private_key_enc: string;
+  public_key: string;
+  created_at: number;
+  retired_at: number | null;
+};
+
+type RawAuditEvent = {
+  id: number;
+  at: number;
+  actor: string;
+  action: string;
+  object: string | null;
+  detail: string | null;
+  source: string | null;
+};
+
 const SERVER_SECRET = 'server_secret';
 
 export class RelayDb {
@@ -207,6 +225,67 @@ export class RelayDb {
       .prepare('SELECT value FROM kv WHERE name = ?')
       .get(SERVER_SECRET) as { value: string };
     return row.value;
+  }
+
+  // ---- registry signing keys (design §4 registry_keys, §7) ----
+
+  insertRegistryKey(key: RegistryKey): void {
+    this.sqlite
+      .prepare(
+        `INSERT INTO registry_keys (kid, private_key_enc, public_key, created_at, retired_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(key.kid, key.privateKeyEnc, key.publicKey, key.createdAt, key.retiredAt);
+  }
+
+  /** The one key currently used for signing (never retired). */
+  getActiveRegistryKey(): RegistryKey | undefined {
+    const row = this.sqlite
+      .prepare(`SELECT * FROM registry_keys WHERE retired_at IS NULL ORDER BY created_at DESC, kid DESC LIMIT 1`)
+      .get() as RawRegistryKey | undefined;
+    return row ? mapRegistryKey(row) : undefined;
+  }
+
+  /** Keys published in the JWKS: active plus those retired within the window. */
+  listRegistryKeysForJwks(now: number, retiredWithinMs: number): RegistryKey[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM registry_keys
+         WHERE retired_at IS NULL OR retired_at > ?
+         ORDER BY created_at DESC, kid DESC`,
+      )
+      .all(now - retiredWithinMs) as unknown as RawRegistryKey[];
+    return rows.map(mapRegistryKey);
+  }
+
+  /** Mark every active key retired (rotation step one); returns how many. */
+  retireActiveRegistryKeys(now: number): number {
+    const result = this.sqlite.prepare(`UPDATE registry_keys SET retired_at = ? WHERE retired_at IS NULL`).run(now);
+    return Number(result.changes);
+  }
+
+  // ---- audit trail (design §4 audit_events, §10.3) ----
+
+  insertAudit(event: {
+    at: number;
+    actor: string;
+    action: string;
+    object?: string | null;
+    detail?: string | null;
+    source?: string | null;
+  }): void {
+    this.sqlite
+      .prepare(`INSERT INTO audit_events (at, actor, action, object, detail, source) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(event.at, event.actor, event.action, event.object ?? null, event.detail ?? null, event.source ?? null);
+  }
+
+  /** Most recent events first (the admin audit view lands in phase D). */
+  listAuditEvents(limit = 100): AuditEvent[] {
+    const clamped = Math.min(Math.max(1, Math.floor(limit)), 500);
+    const rows = this.sqlite
+      .prepare(`SELECT * FROM audit_events ORDER BY id DESC LIMIT ?`)
+      .all(clamped) as unknown as RawAuditEvent[];
+    return rows.map(mapAuditEvent);
   }
 
   insertBot(bot: NewBot): void {
@@ -635,6 +714,28 @@ function mapGrant(row: RawGrant): Grant {
     abandonedAt: row.abandoned_at === null ? null : Number(row.abandoned_at),
     refreshedAt: row.refreshed_at === null ? null : Number(row.refreshed_at),
     refreshedContactVersion: row.refreshed_contact_version === null ? null : Number(row.refreshed_contact_version),
+  };
+}
+
+function mapRegistryKey(row: RawRegistryKey): RegistryKey {
+  return {
+    kid: row.kid,
+    privateKeyEnc: row.private_key_enc,
+    publicKey: row.public_key,
+    createdAt: Number(row.created_at),
+    retiredAt: row.retired_at === null ? null : Number(row.retired_at),
+  };
+}
+
+function mapAuditEvent(row: RawAuditEvent): AuditEvent {
+  return {
+    id: Number(row.id),
+    at: Number(row.at),
+    actor: row.actor,
+    action: row.action,
+    object: row.object,
+    detail: row.detail,
+    source: row.source,
   };
 }
 

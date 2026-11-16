@@ -71,6 +71,18 @@ export type Grant = {
   refreshedContactVersion: number | null;
 };
 
+/** Registry signing key: Ed25519. The private half is encrypted at rest. */
+export type RegistryKey = {
+  kid: string;
+  /** AES-256-GCM encoded PKCS8 private key. */
+  privateKeyEnc: string;
+  /** SPKI DER, base64. Public — also published via the JWKS endpoint. */
+  publicKey: string;
+  createdAt: number;
+  /** Non-null = verification only; still published for the retirement window. */
+  retiredAt: number | null;
+};
+
 export type AuditEvent = {
   id: number;
   at: number;

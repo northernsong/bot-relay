@@ -39,6 +39,7 @@ describe('loadConfig', () => {
     expect(config.loginRatePerMin).toBe(10);
     expect(config.inquiryRatePerMin).toBe(10);
     expect(config.inquiryPairRatePerHour).toBe(5);
+    expect(config.mutationRatePerMin).toBe(30);
     expect(config.defaultRatePerMin).toBe(60);
   });
 
@@ -52,6 +53,7 @@ describe('loadConfig', () => {
       INQUIRY_TTL_SEC: '3600',
       IDENTITY_TOKEN_TTL_SEC: '60',
       REGISTER_RATE_PER_MIN: '3',
+      MUTATION_RATE_PER_MIN: '5',
     });
     expect(config.host).toBe('0.0.0.0');
     expect(config.allowHttpWebhooks).toBe(true);
@@ -60,6 +62,7 @@ describe('loadConfig', () => {
     expect(config.inquiryTtlSec).toBe(3600);
     expect(config.identityTokenTtlSec).toBe(60);
     expect(config.registerRatePerMin).toBe(3);
+    expect(config.mutationRatePerMin).toBe(5);
   });
 
   it('caps the identity token ttl at 300 seconds', () => {

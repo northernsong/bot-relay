@@ -94,8 +94,9 @@ describe('end-to-end: register, discover, inquire, approve, fetch contact', () =
     const hit = world.hook.hits[0]!;
     expect(hit.headers['content-type']).toBe('application/json');
     expect(String(hit.headers['user-agent'])).toMatch(/^bot-relay\//);
-    // Phase C adds the Ed25519 signature header; phase B must not fake one.
-    expect(hit.headers['x-bot-relay-signature']).toBeUndefined();
+    // The outbound inquiry is signed with the registry Ed25519 key (P0-5⑦);
+    // full verification lives in test/identity.test.ts.
+    expect(String(hit.headers['x-bot-relay-signature'])).toMatch(/^v1 kid=rk_[0-9a-f]{16} ts=\d+ sig=[A-Za-z0-9_-]+$/);
     const payload = JSON.parse(hit.body) as Record<string, unknown>;
     expect(payload).toMatchObject({ type: 'inquiry', to: 'bob', from: 'alice', inquiry_id: inquiryId });
     expect(typeof payload.expires_at).toBe('string');

@@ -23,6 +23,8 @@ export type Config = {
   loginRatePerMin: number;
   inquiryRatePerMin: number;
   inquiryPairRatePerHour: number;
+  /** 30/min per design §9.2: inquiry decisions, grant revoke/abandon/refresh, identity token issuance. */
+  mutationRatePerMin: number;
   defaultRatePerMin: number;
 };
 
@@ -48,6 +50,7 @@ export function loadConfig(env: Env = process.env): Config {
     loginRatePerMin: intEnv(env, 'LOGIN_RATE_PER_MIN', 10, 1, 100_000),
     inquiryRatePerMin: intEnv(env, 'INQUIRY_RATE_PER_MIN', 10, 1, 100_000),
     inquiryPairRatePerHour: intEnv(env, 'INQUIRY_PAIR_RATE_PER_HOUR', 5, 1, 100_000),
+    mutationRatePerMin: intEnv(env, 'MUTATION_RATE_PER_MIN', 30, 1, 100_000),
     defaultRatePerMin: intEnv(env, 'DEFAULT_RATE_PER_MIN', 60, 1, 100_000),
   };
 }
