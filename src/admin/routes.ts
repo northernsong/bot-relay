@@ -2,14 +2,13 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import type { Context, Hono } from 'hono';
 
-import { A2A_GATEWAY_ID } from '../a2a/constants.js';
 import { isAdminBearer } from '../auth.js';
 import { limitAuth, requestIsHttps } from '../client-ip.js';
 import type { Deps } from '../deps.js';
 import { HttpError } from '../errors.js';
 import { hashToken } from '../secret.js';
-import { ADMIN_COOKIE, createSession, readCookie, readSession, signSession } from '../session.js';
 import type { Bot } from '../types.js';
+import { ADMIN_COOKIE, createSession, readCookie, readSession, signSession } from '../session.js';
 import { adminCss, adminJs, dashboardPage, loginPage, registerJs, registerPage } from './pages.js';
 
 export function registerAdminRoutes(app: Hono, deps: Deps): void {
@@ -35,7 +34,7 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
       throw new HttpError(401, 'unauthorized', 'Admin token required');
     }
     const session = createSession(deps.now(), deps.config.adminSessionTtlSec);
-    setSessionCookie(c, deps, signSession(session, deps.config.relaySecret));
+    setSessionCookie(c, deps, signSession(session, deps.db.getServerSecret()));
     if (wantsJson(c)) return c.json({ ok: true, csrf: session.csrf });
     return c.redirect('/admin', 303);
   });
@@ -55,7 +54,7 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
 
   app.get('/admin/api/bots', async (c) => {
     await requireAdminAccess(c, deps, false);
-    const bots = deps.db.listBots().filter((bot) => bot.id !== A2A_GATEWAY_ID).map((bot) => presentAdminBot(deps, bot));
+    const bots = deps.db.listBots().map((bot) => presentAdminBot(bot));
     return c.json({ bots });
   });
 
@@ -72,7 +71,6 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
   app.delete('/admin/api/bots/:id', async (c) => {
     await requireAdminAccess(c, deps, true);
     const id = c.req.param('id') ?? '';
-    if (id === A2A_GATEWAY_ID) throw new HttpError(400, 'invalid_request', 'The A2A gateway cannot be deleted');
     if (!deps.db.deleteBot(id)) throw new HttpError(404, 'not_found', 'Bot not found');
     return c.json({ deleted: true, id });
   });
@@ -124,7 +122,6 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
       expiresAt,
       createdAt: deps.now(),
     });
-    const origin = deps.config.publicBaseUrl ?? new URL(c.req.url).origin;
     return c.json({
       invite: {
         id,
@@ -132,7 +129,7 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
         prefix: code.slice(0, 12),
         max_uses: maxUses,
         expires_at: expiresAt === null ? null : new Date(expiresAt).toISOString(),
-        register_url: `${origin}/register?code=${encodeURIComponent(code)}`,
+        register_url: `${deps.config.publicBaseUrl}/register?code=${encodeURIComponent(code)}`,
       },
     }, 201);
   });
@@ -146,25 +143,23 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
   });
 }
 
-function presentAdminBot(deps: Deps, bot: Bot) {
-  const stats = deps.db.botStats(bot.id);
+/** The regular list never includes webhook URLs or secrets (P0-6). */
+function presentAdminBot(bot: Bot) {
   return {
     id: bot.id,
     display_name: bot.displayName,
-    kind: bot.kind,
-    delivery: bot.kind === 'a2a' ? 'a2a' : bot.webhookUrl ? 'webhook' : 'inbox',
+    capabilities: bot.capabilities,
     disabled: bot.disabled,
-    accept_a2a: bot.acceptA2a,
-    message_count: stats.messages,
-    delivery_count: stats.deliveries,
     created_at: new Date(bot.createdAt).toISOString(),
     updated_at: new Date(bot.updatedAt).toISOString(),
+    last_seen_at: bot.lastSeenAt === null ? null : new Date(bot.lastSeenAt).toISOString(),
+    token_set_at: new Date(bot.tokenSetAt).toISOString(),
+    webhook_secret_set_at: new Date(bot.webhookSecretSetAt).toISOString(),
   };
 }
 
 function setDisabled(c: Context, deps: Deps, disabled: boolean) {
   const id = c.req.param('id') ?? '';
-  if (id === A2A_GATEWAY_ID) throw new HttpError(400, 'invalid_request', 'The A2A gateway cannot be disabled');
   const bot = deps.db.getBot(id);
   if (!bot) throw new HttpError(404, 'not_found', 'Bot not found');
   deps.db.updateBot(id, { disabled }, deps.now());
@@ -173,7 +168,6 @@ function setDisabled(c: Context, deps: Deps, disabled: boolean) {
 
 async function requireAdminAccess(c: Context, deps: Deps, mutate: boolean): Promise<void> {
   if (isAdminBearer(deps, c.req.header('authorization'))) return;
-  if (deps.config.trustProxy && cfAccessEmail(c)) return;
   const session = requireSession(c, deps);
   if (mutate) await assertCsrf(c, session);
 }
@@ -186,7 +180,7 @@ function requireSession(c: Context, deps: Deps) {
 
 function currentSession(c: Context, deps: Deps) {
   const raw = readCookie(c.req.header('cookie'), ADMIN_COOKIE);
-  return readSession(raw ?? undefined, deps.config.relaySecret, deps.now());
+  return readSession(raw ?? undefined, deps.db.getServerSecret(), deps.now());
 }
 
 async function assertCsrf(c: Context, session: { csrf: string } | null): Promise<void> {
@@ -203,14 +197,9 @@ async function assertCsrf(c: Context, session: { csrf: string } | null): Promise
 }
 
 function setSessionCookie(c: Context, deps: Deps, value: string): void {
-  const secure = requestIsHttps(c, deps.config.trustProxy) ? '; Secure' : '';
+  const secure = requestIsHttps(c, deps.config.trustedProxies) ? '; Secure' : '';
   const maxAge = deps.config.adminSessionTtlSec;
   c.header('Set-Cookie', `${ADMIN_COOKIE}=${encodeURIComponent(value)}; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=${maxAge}${secure}`);
-}
-
-function cfAccessEmail(c: Context): boolean {
-  const email = c.req.header('cf-access-authenticated-user-email')?.trim() ?? '';
-  return /^[^\s@]+@[^\s@]+$/.test(email);
 }
 
 function wantsJson(c: Context): boolean {

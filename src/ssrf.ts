@@ -29,6 +29,7 @@ block4('198.18.0.0', 15);
 block4('198.51.100.0', 24);
 block4('203.0.113.0', 24);
 block4('224.0.0.0', 4);
+block4('240.0.0.0', 4);
 blocked.addAddress('255.255.255.255', 'ipv4');
 blocked.addAddress('::', 'ipv6');
 blocked.addAddress('::1', 'ipv6');
@@ -36,6 +37,7 @@ block6('fc00::', 7);
 block6('fe80::', 10);
 block6('ff00::', 8);
 block6('2001:db8::', 32);
+block6('2002::', 16);
 
 export function isBlockedIp(raw: string): boolean {
   const host = stripBrackets(raw.trim().toLowerCase());

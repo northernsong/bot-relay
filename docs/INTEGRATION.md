@@ -1,3 +1,5 @@
+> 已过时，将被替换：本文描述的 0.1.0 消息中继与 A2A 已在新设计中整体删除，仅供历史参考，勿按此接入。
+
 # bot-relay integration guide
 
 This document is the contract for connecting a program to a running [bot-relay](../README.md) (version 0.1.0). It matches the routes, headers, JSON fields, and A2A methods implemented in this repository. An operator's deploy guide is the [README](../README.md). Humans who want the architecture and a from-scratch walkthrough should read [ARCHITECTURE_AND_USAGE.md](ARCHITECTURE_AND_USAGE.md) (Simplified Chinese). This file stays the agent contract. If someone tells you to connect to a relay, read this file and use that origin as `BASE`.

@@ -1,6 +1,8 @@
 import { createServer, type IncomingHttpHeaders, type Server } from 'node:http';
 
+import { serve } from '@hono/node-server';
 import type { Hono } from 'hono';
+import { expect } from 'vitest';
 
 import { createApp } from '../src/app.js';
 import type { Config } from '../src/config.js';
@@ -8,7 +10,7 @@ import type { Deps } from '../src/deps.js';
 import { openDatabase } from '../src/db.js';
 
 export const ADMIN = 'test-admin-token';
-export const SECRET = 'test-relay-secret-0123456789';
+export const ENCRYPTION_KEY = 'test-encryption-key-0123456789abcdef';
 
 export type ApiResult = {
   status: number;
@@ -17,36 +19,38 @@ export type ApiResult = {
   text: string;
 };
 
-export function makeApp(overrides: Partial<Config> = {}): { app: Hono; deps: Deps } {
-  const config: Config = {
+export function baseConfig(overrides: Partial<Config> = {}): Config {
+  return {
     port: 0,
     host: '127.0.0.1',
     adminToken: ADMIN,
-    relaySecret: SECRET,
-    maxHops: 8,
-    rateLimitMax: 60,
-    rateLimitWindowSec: 60,
-    deliveryTimeoutMs: 1000,
-    deliveryMaxAttempts: 4,
-    deliveryBackoffMs: 1000,
-    deliveryPollMs: 50,
-    bodyMaxChars: 16_000,
-    metadataMaxChars: 4096,
-    signatureToleranceSec: 300,
-    idempotencyTtlSec: 86_400,
+    encryptionKey: ENCRYPTION_KEY,
+    publicBaseUrl: 'https://relay.example.test',
+    trustedProxies: ['127.0.0.1/32', '::1/128'],
+    adminSessionTtlSec: 3600,
     allowHttpWebhooks: true,
     allowPrivateWebhooks: true,
-    publicBaseUrl: null,
-    a2aBlockTimeoutMs: 20_000,
-    encryptionKey: null,
-    trustProxy: false,
-    authRateLimitMax: 30,
-    adminSessionTtlSec: 3600,
+    rateLimitWindowSec: 60,
+    inquiryTtlSec: 86_400,
+    inquiryDeliveryTimeoutMs: 1000,
+    identityTokenTtlSec: 300,
+    registerRatePerMin: 100,
+    loginRatePerMin: 100,
+    inquiryRatePerMin: 100,
+    inquiryPairRatePerHour: 100,
+    defaultRatePerMin: 100,
     ...overrides,
     databasePath: ':memory:',
   };
+}
+
+export function makeApp(
+  overrides: Partial<Config> = {},
+  depsOverrides: Partial<Deps> = {},
+): { app: Hono; deps: Deps } {
+  const config = baseConfig(overrides);
   const db = openDatabase(':memory:');
-  const deps: Deps = { config, db, now: () => 1_700_000_000_000 };
+  const deps: Deps = { config, db, now: () => 1_700_000_000_000, ...depsOverrides };
   return { app: createApp(deps), deps };
 }
 
@@ -80,6 +84,77 @@ export function expectStatus(result: ApiResult, status: number): any {
     throw new Error(`expected HTTP ${status} but got ${result.status}: ${result.text}`);
   }
   return result.json;
+}
+
+export async function login(app: Hono) {
+  const res = await api(app, '/admin/login', {
+    body: { token: ADMIN },
+    headers: { accept: 'application/json' },
+  });
+  const body = expectStatus(res, 200);
+  const cookie = res.headers.get('set-cookie') ?? '';
+  expect(cookie).toMatch(/HttpOnly/);
+  expect(cookie).toMatch(/SameSite=Strict/);
+  const pair = cookie.split(';')[0] ?? '';
+  return { csrf: body.csrf as string, cookie: pair, headers: { cookie: pair, 'x-csrf-token': body.csrf as string } };
+}
+
+/** Create a bot directly through the invite + register flow and return its token. */
+export async function registerBot(
+  app: Hono,
+  input: { id: string; display_name?: string; invite: string; extra?: Record<string, unknown> },
+): Promise<string> {
+  const created = expectStatus(
+    await api(app, '/v1/register', {
+      body: {
+        invite_code: input.invite,
+        id: input.id,
+        display_name: input.display_name ?? input.id,
+        webhook_url: 'http://127.0.0.1:9/hook',
+        ...(input.extra ?? {}),
+      },
+    }),
+    201,
+  );
+  return created.token as string;
+}
+
+export async function createInvite(
+  app: Hono,
+  session: { headers: Record<string, string> },
+  body: Record<string, unknown> = {},
+): Promise<{ id: number; code: string }> {
+  const created = expectStatus(
+    await api(app, '/admin/api/invites', { body: { max_uses: 1, ...body }, headers: session.headers }),
+    201,
+  );
+  return { id: created.invite.id as number, code: created.invite.code as string };
+}
+
+/**
+ * Serve the app on a real loopback socket so peer-address-based trust
+ * decisions (TRUSTED_PROXIES) behave as in production.
+ */
+export async function startServer(app: Hono): Promise<{
+  url: string;
+  close: () => Promise<void>;
+}> {
+  const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }) as Server;
+  await new Promise<void>((resolve) => {
+    if (server.listening) resolve();
+    else server.once('listening', () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('test server has no port');
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    },
+  };
 }
 
 export async function startWebhook(opts?: { statuses?: number[]; hang?: boolean }): Promise<{

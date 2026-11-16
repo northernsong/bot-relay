@@ -1,33 +1,29 @@
+import { isIP } from 'node:net';
+
 export type Config = {
   port: number;
+  /** Listen address. Loopback only by default; the public entry is a local tunnel client. */
   host: string;
   databasePath: string;
   adminToken: string;
-  relaySecret: string;
-  maxHops: number;
-  rateLimitMax: number;
-  rateLimitWindowSec: number;
-  deliveryTimeoutMs: number;
-  deliveryMaxAttempts: number;
-  deliveryBackoffMs: number;
-  deliveryPollMs: number;
-  bodyMaxChars: number;
-  metadataMaxChars: number;
-  signatureToleranceSec: number;
-  idempotencyTtlSec: number;
+  /** Single source for AES-256-GCM encryption of stored contact details. */
+  encryptionKey: string;
+  /** Public origin of this registry, used in identity tokens and invite links. */
+  publicBaseUrl: string;
+  /** CIDRs (or bare IPs) whose CF-Connecting-IP header is trusted. */
+  trustedProxies: string[];
+  adminSessionTtlSec: number;
   allowHttpWebhooks: boolean;
   allowPrivateWebhooks: boolean;
-  /** Origin used in Agent Card URLs. Request host is used when this is unset. */
-  publicBaseUrl: string | null;
-  /** How long a blocking A2A call waits for a bot reply or a remote terminal task. */
-  a2aBlockTimeoutMs: number;
-  /** Optional dedicated AES key. Null means new secrets still use RELAY_SECRET. */
-  encryptionKey: string | null;
-  /** Trust CF-Connecting-IP / X-Forwarded-For / X-Forwarded-Proto from a reverse proxy. */
-  trustProxy: boolean;
-  /** Per-IP cap for registration and admin login attempts. */
-  authRateLimitMax: number;
-  adminSessionTtlSec: number;
+  rateLimitWindowSec: number;
+  inquiryTtlSec: number;
+  inquiryDeliveryTimeoutMs: number;
+  identityTokenTtlSec: number;
+  registerRatePerMin: number;
+  loginRatePerMin: number;
+  inquiryRatePerMin: number;
+  inquiryPairRatePerHour: number;
+  defaultRatePerMin: number;
 };
 
 type Env = Record<string, string | undefined>;
@@ -35,35 +31,32 @@ type Env = Record<string, string | undefined>;
 export function loadConfig(env: Env = process.env): Config {
   return {
     port: intEnv(env, 'PORT', 8080, 1, 65535),
-    host: env.HOST?.trim() || '0.0.0.0',
+    host: env.HOST?.trim() || '127.0.0.1',
     databasePath: env.DATABASE_PATH?.trim() || './data/bot-relay.sqlite',
     adminToken: secretEnv(env, 'ADMIN_TOKEN', 8),
-    relaySecret: secretEnv(env, 'RELAY_SECRET', 16),
-    maxHops: intEnv(env, 'MAX_HOPS', 8, 1, 1000),
-    rateLimitMax: intEnv(env, 'RATE_LIMIT_MAX', 60, 1, 100_000),
-    rateLimitWindowSec: intEnv(env, 'RATE_LIMIT_WINDOW_SEC', 60, 1, 86_400),
-    deliveryTimeoutMs: intEnv(env, 'DELIVERY_TIMEOUT_MS', 10_000, 100, 120_000),
-    deliveryMaxAttempts: intEnv(env, 'DELIVERY_MAX_ATTEMPTS', 4, 1, 20),
-    deliveryBackoffMs: intEnv(env, 'DELIVERY_BACKOFF_MS', 500, 0, 300_000),
-    deliveryPollMs: intEnv(env, 'DELIVERY_POLL_MS', 500, 50, 60_000),
-    bodyMaxChars: intEnv(env, 'BODY_MAX_CHARS', 16_000, 1, 100_000),
-    metadataMaxChars: intEnv(env, 'METADATA_MAX_CHARS', 4096, 1, 64_000),
-    signatureToleranceSec: intEnv(env, 'SIGNATURE_TOLERANCE_SEC', 300, 0, 86_400),
-    idempotencyTtlSec: intEnv(env, 'IDEMPOTENCY_TTL_SEC', 86_400, 60, 30 * 86_400),
+    encryptionKey: secretEnv(env, 'ENCRYPTION_KEY', 32),
+    publicBaseUrl: requiredBaseUrl(env, 'PUBLIC_BASE_URL'),
+    trustedProxies: cidrListEnv(env, 'TRUSTED_PROXIES', ['127.0.0.1/32', '::1/128']),
+    adminSessionTtlSec: intEnv(env, 'ADMIN_SESSION_TTL_SEC', 12 * 3600, 60, 30 * 86_400),
     allowHttpWebhooks: boolEnv(env, 'ALLOW_HTTP_WEBHOOKS', false),
     allowPrivateWebhooks: boolEnv(env, 'ALLOW_PRIVATE_WEBHOOKS', false),
-    publicBaseUrl: optionalBaseUrl(env, 'PUBLIC_BASE_URL'),
-    a2aBlockTimeoutMs: intEnv(env, 'A2A_BLOCK_TIMEOUT_MS', 20_000, 0, 120_000),
-    encryptionKey: optionalSecret(env, 'ENCRYPTION_KEY', 16),
-    trustProxy: boolEnv(env, 'TRUST_PROXY', false),
-    authRateLimitMax: intEnv(env, 'AUTH_RATE_LIMIT_MAX', 30, 1, 100_000),
-    adminSessionTtlSec: intEnv(env, 'ADMIN_SESSION_TTL_SEC', 12 * 3600, 60, 30 * 86_400),
+    rateLimitWindowSec: intEnv(env, 'RATE_LIMIT_WINDOW_SEC', 60, 1, 86_400),
+    inquiryTtlSec: intEnv(env, 'INQUIRY_TTL_SEC', 86_400, 60, 30 * 86_400),
+    inquiryDeliveryTimeoutMs: intEnv(env, 'INQUIRY_DELIVERY_TIMEOUT_MS', 10_000, 100, 120_000),
+    identityTokenTtlSec: intEnv(env, 'IDENTITY_TOKEN_TTL_SEC', 300, 1, 300),
+    registerRatePerMin: intEnv(env, 'REGISTER_RATE_PER_MIN', 10, 1, 100_000),
+    loginRatePerMin: intEnv(env, 'LOGIN_RATE_PER_MIN', 10, 1, 100_000),
+    inquiryRatePerMin: intEnv(env, 'INQUIRY_RATE_PER_MIN', 10, 1, 100_000),
+    inquiryPairRatePerHour: intEnv(env, 'INQUIRY_PAIR_RATE_PER_HOUR', 5, 1, 100_000),
+    defaultRatePerMin: intEnv(env, 'DEFAULT_RATE_PER_MIN', 60, 1, 100_000),
   };
 }
 
-function optionalBaseUrl(env: Env, name: string): string | null {
+function requiredBaseUrl(env: Env, name: string): string {
   const raw = env[name];
-  if (raw === undefined || raw.trim() === '') return null;
+  if (raw === undefined || raw.trim() === '') {
+    throw new Error(`${name} is required and must be an absolute http(s) URL, for example https://relay.example.com`);
+  }
   let url: URL;
   try {
     url = new URL(raw.trim());
@@ -77,16 +70,32 @@ function optionalBaseUrl(env: Env, name: string): string | null {
   return `${url.origin}${path}`;
 }
 
-function optionalSecret(env: Env, name: string, min: number): string | null {
-  const value = env[name];
-  if (value === undefined || value === '') return null;
-  if (value.length < min) {
-    throw new Error(`${name} must be at least ${min} characters. Generate one with: openssl rand -hex 32`);
+function cidrListEnv(env: Env, name: string, fallback: string[]): string[] {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') return [...fallback];
+  const entries = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+  if (entries.length === 0) return [...fallback];
+  for (const entry of entries) {
+    if (!isValidIpOrCidr(entry)) {
+      throw new Error(`${name} must be a comma-separated list of IPs or CIDR ranges, for example 127.0.0.1/32,::1/128`);
+    }
   }
-  if (value.includes('\n') || value.includes('\r') || value !== value.trim()) {
-    throw new Error(`${name} must not contain whitespace or newlines`);
-  }
-  return value;
+  return entries;
+}
+
+export function isValidIpOrCidr(entry: string): boolean {
+  const slash = entry.lastIndexOf('/');
+  const address = slash === -1 ? entry : entry.slice(0, slash);
+  const family = isIP(address);
+  if (family === 0) return false;
+  if (slash === -1) return true;
+  const prefix = entry.slice(slash + 1);
+  if (!/^\d+$/.test(prefix)) return false;
+  const bits = Number(prefix);
+  return bits >= 0 && bits <= (family === 6 ? 128 : 32);
 }
 
 function secretEnv(env: Env, name: string, min: number): string {

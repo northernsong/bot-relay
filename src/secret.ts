@@ -1,11 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
+/** Bot access token. Shown to the owner exactly once; only the sha256 hash is stored. */
 export function newToken(): string {
-  return `rl_${randomBytes(32).toString('base64url')}`;
-}
-
-export function newA2aToken(): string {
-  return `a2a_${randomBytes(32).toString('base64url')}`;
+  return `br_${randomBytes(32).toString('base64url')}`;
 }
 
 export function hashToken(token: string): string {
@@ -19,22 +16,19 @@ export function secretsMatch(provided: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-export type CryptoKeys = {
-  relaySecret: string;
-  /** When null, new ciphertext uses the RELAY_SECRET-derived key (v1). */
-  encryptionKey: string | null;
-};
+const VERSION = 'v1';
+const KEY_LABEL = 'bot-relay/encryption-key';
 
-function deriveKey(label: string, secret: string): Buffer {
-  return createHash('sha256').update(`${label}\0${secret}`).digest();
+function deriveKey(secret: string): Buffer {
+  return createHash('sha256').update(`${KEY_LABEL}\0${secret}`).digest();
 }
 
-function seal(version: 'v1' | 'v2', plain: string, key: Buffer): string {
+function seal(plain: string, key: Buffer): string {
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const ciphertext = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return `${version}:${Buffer.concat([iv, tag, ciphertext]).toString('base64')}`;
+  return `${VERSION}:${Buffer.concat([iv, tag, ciphertext]).toString('base64')}`;
 }
 
 function open(enc: string, key: Buffer): string {
@@ -48,28 +42,12 @@ function open(enc: string, key: Buffer): string {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
 }
 
-function asKeys(secretOrKeys: string | CryptoKeys): CryptoKeys {
-  if (typeof secretOrKeys === 'string') return { relaySecret: secretOrKeys, encryptionKey: null };
-  return secretOrKeys;
+/** AES-256-GCM with the single key derived from ENCRYPTION_KEY. */
+export function encryptSecret(plain: string, encryptionKey: string): string {
+  return seal(plain, deriveKey(encryptionKey));
 }
 
-/**
- * AES-256-GCM. `v1:` is the historical key derived from RELAY_SECRET.
- * `v2:` uses ENCRYPTION_KEY when it is configured. Decrypt still opens `v1:`
- * with RELAY_SECRET so existing rows keep working after the new variable is set.
- */
-export function encryptSecret(plain: string, secretOrKeys: string | CryptoKeys): string {
-  const keys = asKeys(secretOrKeys);
-  if (keys.encryptionKey) return seal('v2', plain, deriveKey('bot-relay/encryption-key/v2', keys.encryptionKey));
-  return seal('v1', plain, deriveKey('bot-relay/webhook-secret/v1', keys.relaySecret));
-}
-
-export function decryptSecret(enc: string, secretOrKeys: string | CryptoKeys): string {
-  const keys = asKeys(secretOrKeys);
-  if (enc.startsWith('v2:')) {
-    if (!keys.encryptionKey) throw new Error('missing encryption key');
-    return open(enc, deriveKey('bot-relay/encryption-key/v2', keys.encryptionKey));
-  }
-  if (enc.startsWith('v1:')) return open(enc, deriveKey('bot-relay/webhook-secret/v1', keys.relaySecret));
-  throw new Error('unknown secret version');
+export function decryptSecret(enc: string, encryptionKey: string): string {
+  if (!enc.startsWith(`${VERSION}:`)) throw new Error('unknown secret version');
+  return open(enc, deriveKey(encryptionKey));
 }

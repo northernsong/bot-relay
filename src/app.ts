@@ -1,37 +1,27 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 
-import { loadRemoteAgent } from './a2a/card.js';
-import { A2A_GATEWAY_ID } from './a2a/constants.js';
-import { registerA2aRoutes } from './a2a/routes.js';
 import { registerAdminRoutes } from './admin/routes.js';
-import { isAdminBearer, requireAdmin, requireBot } from './auth.js';
 import { limitAuth } from './client-ip.js';
 import type { Deps } from './deps.js';
 import { HttpError, isUniqueConstraint } from './errors.js';
-import { presentMessage, presentOwnBot, presentPublicBot } from './present.js';
-import { encryptSecret, hashToken, newA2aToken, newToken, type CryptoKeys } from './secret.js';
-import { sendMessage } from './send.js';
+import { decryptSecret, encryptSecret, hashToken, newToken } from './secret.js';
 import { assertWebhookUrl } from './ssrf.js';
-import type { Bot, BotKind, BotPatch, SendInput } from './types.js';
+import type { Bot } from './types.js';
 import {
   isPlainObject,
-  parseAllowlist,
   parseBotId,
+  parseCapabilities,
   parseDisplayName,
   parseHeaderName,
   parseHeaderValue,
-  parseIdempotencyKey,
-  parseLimit,
-  parseMessageBody,
-  parseMetadata,
-  parseReplyTo,
-  parseThreadId,
+  parseIntake,
   rejectUnknown,
 } from './validate.js';
 import { VERSION } from './version.js';
 
 const MAX_REQUEST_CHARS = 65_536;
+const INVITE_CODE = /^inv_[A-Za-z0-9_-]{16,80}$/;
 
 export function createApp(deps: Deps): Hono {
   const app = new Hono();
@@ -49,7 +39,7 @@ export function createApp(deps: Deps): Hono {
       );
     }
     const path = c.req.path;
-    if (path.startsWith('/admin') || path.startsWith('/register') || path.startsWith('/bots') || path.startsWith('/messages') || path.startsWith('/inbox')) {
+    if (path.startsWith('/admin') || path.startsWith('/register') || path.startsWith('/v1')) {
       c.header('Cache-Control', 'no-store');
     }
   });
@@ -77,278 +67,114 @@ export function createApp(deps: Deps): Hono {
     return c.json({ ok: true, version: VERSION, db: 'ok' });
   });
 
-  app.post('/bots', async (c) => {
+  app.post('/v1/register', async (c) => {
     await limitAuth(deps, c, 'register');
     const body = await readJsonObject(c);
-    const inviteHash = inviteHashForRegistration(deps, c.req.header('authorization'), body.invite_code);
-    return c.json(await performRegistration(deps, body, inviteHash), 201);
-  });
-
-  app.post('/register', async (c) => {
-    await limitAuth(deps, c, 'register');
-    const body = await readFlexibleObject(c);
-    if (typeof body.invite_code !== 'string') {
-      throw new HttpError(403, 'invite_invalid', 'Invite code required');
-    }
-    const created = await performRegistration(deps, body, hashToken(body.invite_code.trim()));
-    return c.json(created, 201);
-  });
-
-async function performRegistration(deps: Deps, body: Record<string, unknown>, inviteHash: string | null): Promise<Record<string, unknown>> {
     rejectUnknown(body, [
+      'invite_code',
       'id',
       'display_name',
+      'capabilities',
       'webhook_url',
-      'auth_header_name',
-      'auth_header_value',
-      'allowlist',
-      'a2a_card_url',
-      'accept_a2a',
-      'invite_code',
+      'webhook_auth_name',
+      'webhook_auth_value',
+      'intake',
     ]);
+    const inviteHash = hashToken(parseInviteCode(body.invite_code));
     const id = parseBotId(body.id);
     const displayName = parseDisplayName(body.display_name);
-    const allowlist = parseAllowlist(body.allowlist);
-    const peer = body.a2a_card_url !== undefined && body.a2a_card_url !== null;
-    if (peer && body.webhook_url) {
-      throw new HttpError(400, 'invalid_request', 'Set webhook_url or a2a_card_url, not both');
-    }
-    let kind: BotKind = 'relay';
-    let webhookUrl = await parseOptionalWebhook(deps, peer ? undefined : body.webhook_url);
-    let auth = peer ? { name: null as string | null, value: null as string | null } : parseCreateAuth(body.auth_header_name, body.auth_header_value);
-    let a2aCardUrl: string | null = null;
-    let a2aEndpoint: string | null = null;
-    let a2aAuthIn: 'header' | 'query' | null = null;
-    let a2aTenant: string | null = null;
-    let acceptA2a = true;
-    let a2aToken: string | undefined;
-    if (peer) {
-      if ('accept_a2a' in body && body.accept_a2a !== false) {
-        throw new HttpError(400, 'invalid_request', 'External A2A agents are not hosted on this relay');
-      }
-      const remote = await loadRemoteAgent(deps, body.a2a_card_url, body.auth_header_name, body.auth_header_value);
-      kind = 'a2a';
-      webhookUrl = null;
-      acceptA2a = false;
-      a2aCardUrl = remote.cardUrl;
-      a2aEndpoint = remote.endpoint;
-      a2aAuthIn = remote.authIn;
-      a2aTenant = remote.tenant;
-      auth = { name: remote.authName, value: remote.authValue };
-    } else if ('accept_a2a' in body) {
-      acceptA2a = parseBool(body.accept_a2a, 'accept_a2a');
-    }
-    if (acceptA2a) a2aToken = newA2aToken();
+    const capabilities = parseCapabilities(body.capabilities);
+    const webhookUrl = await parseWebhookUrl(deps, body.webhook_url);
+    const auth = parseWebhookAuth(body.webhook_auth_name, body.webhook_auth_value);
+    const intake = parseIntake(body.intake);
+
     const token = newToken();
     const now = deps.now();
     try {
       deps.db.transaction(() => {
-      if (inviteHash && !deps.db.consumeInvite(inviteHash, now)) {
-        throw new HttpError(403, 'invite_invalid', 'Invite code is invalid, expired, revoked, or used up');
-      }
-      deps.db.insertBot({
-        id,
-        displayName,
-        webhookUrl,
-        authHeaderName: auth.name,
-        authHeaderValueEnc: auth.value ? encryptSecret(auth.value, cryptoKeys(deps)) : null,
-        tokenHash: hashToken(token),
-        allowlist,
-        kind,
-        a2aCardUrl,
-        a2aEndpoint,
-        a2aInboundTokenHash: a2aToken ? hashToken(a2aToken) : null,
-        acceptA2a,
-        a2aAuthIn,
-        a2aTenant,
-        createdAt: now,
-        updatedAt: now,
-      });
+        if (!deps.db.consumeInvite(inviteHash, now)) {
+          throw new HttpError(403, 'invite_invalid', 'Invite code is invalid, expired, revoked, or used up');
+        }
+        deps.db.insertBot({
+          id,
+          displayName,
+          capabilities,
+          webhookUrlEnc: encryptSecret(webhookUrl, deps.config.encryptionKey),
+          webhookAuthName: auth.name,
+          webhookAuthValueEnc: auth.value === null ? '' : encryptSecret(auth.value, deps.config.encryptionKey),
+          tokenHash: hashToken(token),
+          tokenSetAt: now,
+          tokenRevokedAt: null,
+          disabled: false,
+          intakeMode: intake.mode,
+          intakeAllowlist: intake.allowlist,
+          createdAt: now,
+          updatedAt: now,
+          lastSeenAt: null,
+        });
       });
     } catch (err) {
       if (isUniqueConstraint(err, 'bots.id')) {
-        throw new HttpError(409, 'already_registered', `Bot id "${id}" is already registered`);
+        throw new HttpError(409, 'id_taken', `Bot id "${id}" is already registered`);
       }
       throw err;
     }
     const bot = deps.db.getBot(id);
     if (!bot) throw new HttpError(500, 'internal', 'Bot disappeared after insert');
-    return presentOwnBot(bot, token, a2aToken);
-}
-
-  app.get('/bots/me', (c) => {
-    const bot = requireBot(deps, c.req.header('authorization'));
-    return c.json(presentOwnBot(bot));
-  });
-
-  app.patch('/bots/me', async (c) => {
-    const bot = requireBot(deps, c.req.header('authorization'));
-    const body = await readJsonObject(c);
-    rejectUnknown(body, [
-      'display_name',
-      'webhook_url',
-      'auth_header_name',
-      'auth_header_value',
-      'allowlist',
-      'rotate_token',
-      'accept_a2a',
-      'rotate_a2a_token',
-    ]);
-    if (Object.keys(body).length === 0) {
-      throw new HttpError(400, 'invalid_request', 'No fields to update');
-    }
-    const patch: BotPatch = {};
-    if ('display_name' in body) patch.displayName = parseDisplayName(body.display_name);
-    if ('webhook_url' in body) {
-      if (bot.kind === 'a2a') throw new HttpError(400, 'invalid_request', 'External A2A agents do not use webhook_url');
-      patch.webhookUrl = await parseOptionalWebhook(deps, body.webhook_url);
-    }
-    if ('accept_a2a' in body) {
-      if (bot.kind === 'a2a') throw new HttpError(400, 'invalid_request', 'External A2A agents are not hosted on this relay');
-      patch.acceptA2a = parseBool(body.accept_a2a, 'accept_a2a');
-    }
-    if ('allowlist' in body) patch.allowlist = parseAllowlist(body.allowlist);
-    applyAuthPatch(deps, bot, body, patch);
-
-    let token: string | undefined;
-    let a2aToken: string | undefined;
-    if ('rotate_a2a_token' in body) {
-      if (body.rotate_a2a_token !== true && body.rotate_a2a_token !== false) {
-        throw new HttpError(400, 'invalid_request', 'rotate_a2a_token must be a boolean');
-      }
-      if (body.rotate_a2a_token === true) {
-        if (bot.kind !== 'relay') throw new HttpError(400, 'invalid_request', 'Only hosted bots have an A2A token');
-        a2aToken = newA2aToken();
-        patch.a2aInboundTokenHash = hashToken(a2aToken);
-      }
-    }
-    if (patch.acceptA2a === true && !bot.a2aInboundTokenHash && !a2aToken) {
-      a2aToken = newA2aToken();
-      patch.a2aInboundTokenHash = hashToken(a2aToken);
-    }
-    if ('rotate_token' in body) {
-      if (body.rotate_token !== true && body.rotate_token !== false) {
-        throw new HttpError(400, 'invalid_request', 'rotate_token must be a boolean');
-      }
-      if (body.rotate_token === true) {
-        token = newToken();
-        patch.tokenHash = hashToken(token);
-      }
-    }
-
-    deps.db.updateBot(bot.id, patch, deps.now());
-    const updated = deps.db.getBot(bot.id);
-    if (!updated) throw new HttpError(500, 'internal', 'Bot disappeared after update');
-    return c.json(presentOwnBot(updated, token, a2aToken));
-  });
-
-  app.delete('/bots/me', (c) => {
-    const bot = requireBot(deps, c.req.header('authorization'));
-    if (bot.id === A2A_GATEWAY_ID) throw new HttpError(400, 'invalid_request', 'The A2A gateway cannot be deleted');
-    deps.db.deleteBot(bot.id);
-    return c.json({ deleted: true, id: bot.id });
-  });
-
-  app.get('/bots/:id', (c) => {
-    requireBot(deps, c.req.header('authorization'));
-    const id = c.req.param('id');
-    const bot = deps.db.getBot(id);
-    if (!bot) throw new HttpError(404, 'not_found', 'Bot not found');
-    return c.json(presentPublicBot(bot));
-  });
-
-  app.delete('/bots/:id', (c) => {
-    requireAdmin(deps, c.req.header('authorization'));
-    const id = c.req.param('id');
-    if (id === A2A_GATEWAY_ID) throw new HttpError(400, 'invalid_request', 'The A2A gateway cannot be deleted');
-    if (!deps.db.deleteBot(id)) throw new HttpError(404, 'not_found', 'Bot not found');
-    return c.json({ deleted: true, id });
-  });
-
-  app.post('/messages', async (c) => {
-    const sender = requireBot(deps, c.req.header('authorization'));
-    const body = await readJsonObject(c);
-    rejectUnknown(body, ['to', 'body', 'thread_id', 'reply_to', 'metadata']);
-    const input: SendInput = {
-      to: body.to === A2A_GATEWAY_ID ? A2A_GATEWAY_ID : parseBotId(body.to, 'to'),
-      body: parseMessageBody(body.body, deps.config.bodyMaxChars),
-      threadId: parseThreadId(body.thread_id),
-      replyTo: parseReplyTo(body.reply_to),
-      metadata: parseMetadata(body.metadata, deps.config.metadataMaxChars),
-    };
-    const idemHeader = c.req.header('idempotency-key');
-    const idemKey = idemHeader === undefined ? null : parseIdempotencyKey(idemHeader);
-    const result = await sendMessage(deps, sender, input, idemKey);
-    if (result.replayed) c.header('idempotent-replayed', 'true');
-    const attempts = deps.db.listAttempts(result.message.id);
-    return c.json(presentMessage(result.message, deps.config.maxHops, attempts), result.replayed ? 200 : 202);
-  });
-
-  app.get('/messages/:id', (c) => {
-    const bot = requireBot(deps, c.req.header('authorization'));
-    const message = deps.db.getMessage(c.req.param('id'));
-    if (!message || (message.fromId !== bot.id && message.toId !== bot.id)) {
-      throw new HttpError(404, 'not_found', 'Message not found');
-    }
-    return c.json(presentMessage(message, deps.config.maxHops, deps.db.listAttempts(message.id)));
-  });
-
-  app.get('/inbox', (c) => {
-    const bot = requireBot(deps, c.req.header('authorization'));
-    const limit = parseLimit(c.req.query('limit'));
-    const messages = deps.db.listInbox(bot.id, limit).map((message) => presentMessage(message, deps.config.maxHops));
-    return c.json({ messages });
-  });
-
-  app.post('/inbox/ack', async (c) => {
-    const bot = requireBot(deps, c.req.header('authorization'));
-    const body = await readJsonObject(c);
-    rejectUnknown(body, ['ids']);
-    if (!Array.isArray(body.ids)) throw new HttpError(400, 'invalid_request', 'ids must be an array of message ids');
-    if (body.ids.length > 100) throw new HttpError(400, 'invalid_request', 'ids cannot contain more than 100 entries');
-    const ids: string[] = [];
-    for (const id of body.ids) {
-      if (typeof id !== 'string' || !/^msg_[A-Za-z0-9_-]{10,80}$/.test(id)) {
-        throw new HttpError(400, 'invalid_request', 'ids must be relay message ids');
-      }
-      ids.push(id);
-    }
-    const acked = deps.db.ackInbox(bot.id, ids, deps.now());
-    return c.json({ acked });
+    return c.json({ bot: presentOwnBot(deps, bot), token }, 201);
   });
 
   registerAdminRoutes(app, deps);
-  registerA2aRoutes(app, deps);
   return app;
 }
 
-function inviteHashForRegistration(deps: Deps, authorization: string | undefined, inviteCode: unknown): string | null {
-  if (isAdminBearer(deps, authorization)) return null;
-  if (typeof inviteCode !== 'string' || !/^inv_[A-Za-z0-9_-]{16,80}$/.test(inviteCode.trim())) {
-    throw new HttpError(401, 'unauthorized', 'Admin token or invite code required', { 'www-authenticate': 'Bearer' });
+function parseInviteCode(value: unknown): string {
+  if (typeof value !== 'string' || !INVITE_CODE.test(value.trim())) {
+    throw new HttpError(403, 'invite_invalid', 'Invite code required');
   }
-  return hashToken(inviteCode.trim());
+  return value.trim();
 }
 
-async function readFlexibleObject(c: Context): Promise<Record<string, unknown>> {
-  const contentType = c.req.header('content-type')?.split(';')[0]?.trim().toLowerCase();
-  if (contentType === 'application/x-www-form-urlencoded') {
-    const raw = await c.req.text();
-    const params = new URLSearchParams(raw);
-    const body: Record<string, unknown> = {};
-    for (const [key, value] of params.entries()) body[key] = value;
-    return body;
+async function parseWebhookUrl(deps: Deps, value: unknown): Promise<string> {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) {
+    throw new HttpError(400, 'invalid_webhook', 'webhook_url must be an https URL');
   }
-  return readJsonObject(c);
+  return assertWebhookUrl(value, {
+    allowHttp: deps.config.allowHttpWebhooks,
+    allowPrivate: deps.config.allowPrivateWebhooks,
+    lookupHost: deps.lookup,
+  });
 }
 
-function cryptoKeys(deps: Deps): CryptoKeys {
-  return { relaySecret: deps.config.relaySecret, encryptionKey: deps.config.encryptionKey };
+function parseWebhookAuth(nameRaw: unknown, valueRaw: unknown): { name: string; value: string | null } {
+  const nameMissing = nameRaw === undefined || nameRaw === null || nameRaw === '';
+  const valueMissing = valueRaw === undefined || valueRaw === null || valueRaw === '';
+  if (nameMissing && valueMissing) return { name: '', value: null };
+  if (nameMissing || valueMissing) {
+    throw new HttpError(400, 'invalid_request', 'webhook_auth_name and webhook_auth_value must be set together');
+  }
+  return { name: parseHeaderName(nameRaw), value: parseHeaderValue(valueRaw) };
 }
 
-function parseBool(value: unknown, field: string): boolean {
-  if (typeof value !== 'boolean') throw new HttpError(400, 'invalid_request', `${field} must be a boolean`);
-  return value;
+function presentOwnBot(deps: Deps, bot: Bot): Record<string, unknown> {
+  const intake =
+    bot.intakeMode === 'allowlist'
+      ? { mode: bot.intakeMode, allowlist: bot.intakeAllowlist ?? [] }
+      : { mode: bot.intakeMode };
+  return {
+    id: bot.id,
+    display_name: bot.displayName,
+    capabilities: bot.capabilities,
+    webhook_url: decryptSecret(bot.webhookUrlEnc, deps.config.encryptionKey),
+    webhook_auth_name: bot.webhookAuthName === '' ? null : bot.webhookAuthName,
+    webhook_auth_value: bot.webhookAuthValueEnc === '' ? null : decryptSecret(bot.webhookAuthValueEnc, deps.config.encryptionKey),
+    intake,
+    contact_version: bot.contactVersion,
+    disabled: bot.disabled,
+    token_set_at: iso(bot.tokenSetAt),
+    created_at: iso(bot.createdAt),
+    updated_at: iso(bot.updatedAt),
+  };
 }
 
 async function readJsonObject(c: Context): Promise<Record<string, unknown>> {
@@ -375,64 +201,6 @@ async function readJsonObject(c: Context): Promise<Record<string, unknown>> {
   return parsed;
 }
 
-async function parseOptionalWebhook(deps: Deps, value: unknown): Promise<string | null> {
-  if (value === undefined || value === null) return null;
-  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) {
-    throw new HttpError(400, 'invalid_webhook', 'webhook_url must be an https URL');
-  }
-  return assertWebhookUrl(value, {
-    allowHttp: deps.config.allowHttpWebhooks,
-    allowPrivate: deps.config.allowPrivateWebhooks,
-    lookupHost: deps.lookup,
-  });
-}
-
-function parseCreateAuth(nameRaw: unknown, valueRaw: unknown): { name: string | null; value: string | null } {
-  const nameMissing = nameRaw === undefined || nameRaw === null;
-  const valueMissing = valueRaw === undefined || valueRaw === null || valueRaw === '';
-  if (nameMissing && valueMissing) return { name: null, value: null };
-  if (nameMissing || valueMissing) {
-    throw new HttpError(400, 'invalid_request', 'auth_header_name and auth_header_value must be set together');
-  }
-  return { name: parseHeaderName(nameRaw), value: parseHeaderValue(valueRaw) };
-}
-
-function applyAuthPatch(deps: Deps, bot: Bot, body: Record<string, unknown>, patch: BotPatch): void {
-  const nameIn = 'auth_header_name' in body;
-  const valueIn = 'auth_header_value' in body;
-  if (!nameIn && !valueIn) return;
-
-  let name = bot.authHeaderName;
-  if (nameIn) {
-    if (body.auth_header_name === null) name = null;
-    else name = parseHeaderName(body.auth_header_name);
-  }
-  if (name === null && valueIn && body.auth_header_value) {
-    throw new HttpError(400, 'invalid_request', 'Cannot set auth_header_value while clearing auth_header_name');
-  }
-
-  let valueAction: 'keep' | 'clear' | 'set' = 'keep';
-  let newValue = '';
-  if (valueIn) {
-    if (body.auth_header_value === null || body.auth_header_value === '') valueAction = 'clear';
-    else {
-      valueAction = 'set';
-      newValue = parseHeaderValue(body.auth_header_value);
-    }
-  }
-  if (name === null) valueAction = 'clear';
-
-  if (name && valueAction === 'clear') {
-    throw new HttpError(400, 'invalid_request', 'auth_header_name requires auth_header_value');
-  }
-  if (name && valueAction === 'keep' && !bot.authHeaderValueEnc) {
-    throw new HttpError(400, 'invalid_request', 'auth_header_name requires auth_header_value');
-  }
-  if (!name && valueAction === 'set') {
-    throw new HttpError(400, 'invalid_request', 'auth_header_value requires auth_header_name');
-  }
-
-  patch.authHeaderName = name;
-  if (valueAction === 'set') patch.authHeaderValueEnc = encryptSecret(newValue, cryptoKeys(deps));
-  if (valueAction === 'clear') patch.authHeaderValueEnc = null;
+function iso(ms: number): string {
+  return new Date(ms).toISOString();
 }

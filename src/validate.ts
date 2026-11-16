@@ -1,13 +1,7 @@
-import { createHash } from 'node:crypto';
-
-import { A2A_GATEWAY_ID } from './a2a/constants.js';
 import { HttpError } from './errors.js';
-import type { SendInput } from './types.js';
 
 const BOT_ID = /^[a-z0-9][a-z0-9_-]{1,31}$/;
-const RESERVED_IDS = new Set(['me', A2A_GATEWAY_ID]);
-const THREAD_ID = /^[A-Za-z0-9_-]{1,80}$/;
-const MESSAGE_ID = /^msg_[A-Za-z0-9_-]{10,80}$/;
+const RESERVED_IDS = new Set(['me', 'admin', 'registry']);
 const HEADER_NAME = /^[A-Za-z0-9-]{1,64}$/;
 const RESERVED_HEADERS = new Set([
   'host',
@@ -20,9 +14,7 @@ const RESERVED_HEADERS = new Set([
   'te',
   'trailer',
   'proxy-authorization',
-  'x-bot-relay-signature',
-  'x-bot-relay-timestamp',
-  'x-bot-relay-id',
+  'x-bot-relay-identity',
 ]);
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -61,53 +53,52 @@ export function parseDisplayName(value: unknown): string {
   return name;
 }
 
-export function parseMessageBody(value: unknown, maxChars: number): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new HttpError(400, 'invalid_request', 'body must be a non-empty string');
+export function parseCapabilities(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') {
+    throw new HttpError(400, 'invalid_request', 'capabilities must be a string');
   }
-  if (value.length > maxChars) {
-    throw new HttpError(413, 'payload_too_large', `body exceeds ${maxChars} characters`);
+  const text = value.trim();
+  if (text.length > 500) {
+    throw new HttpError(400, 'invalid_request', 'capabilities must be at most 500 characters');
   }
-  return value;
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(text)) {
+    throw new HttpError(400, 'invalid_request', 'capabilities contains control characters');
+  }
+  return text;
 }
 
-export function parseThreadId(value: unknown): string | null {
-  if (value === undefined || value === null) return null;
-  if (typeof value !== 'string' || !THREAD_ID.test(value)) {
-    throw new HttpError(400, 'invalid_request', 'thread_id must be 1-80 characters of letters, digits, "_" or "-"');
-  }
-  return value;
-}
-
-export function parseReplyTo(value: unknown): string | null {
-  if (value === undefined || value === null) return null;
-  if (typeof value !== 'string' || !MESSAGE_ID.test(value)) {
-    throw new HttpError(400, 'invalid_request', 'reply_to must be a relay message id');
-  }
-  return value;
-}
-
-export function parseMetadata(value: unknown, maxChars: number): unknown | null {
-  if (value === undefined || value === null) return null;
+/** Receiver-side intake control: who is allowed to open inquiries against this bot. */
+export function parseIntake(value: unknown): { mode: 'open' | 'allowlist' | 'none'; allowlist: string[] | null } {
+  if (value === undefined || value === null) return { mode: 'open', allowlist: null };
   if (!isPlainObject(value)) {
-    throw new HttpError(400, 'invalid_request', 'metadata must be a JSON object');
+    throw new HttpError(400, 'invalid_request', 'intake must be an object with a mode');
   }
-  assertDepth(value, 0);
-  if (JSON.stringify(value).length > maxChars) {
-    throw new HttpError(413, 'payload_too_large', `metadata exceeds ${maxChars} characters`);
+  rejectUnknown(value, ['mode', 'allowlist']);
+  const mode = value.mode;
+  if (mode !== 'open' && mode !== 'allowlist' && mode !== 'none') {
+    throw new HttpError(400, 'invalid_request', 'intake.mode must be "open", "allowlist", or "none"');
   }
-  return value;
+  if (value.allowlist === undefined || value.allowlist === null) {
+    if (mode === 'allowlist') {
+      throw new HttpError(400, 'invalid_request', 'intake.allowlist is required when intake.mode is "allowlist"');
+    }
+    return { mode, allowlist: null };
+  }
+  if (mode !== 'allowlist') {
+    throw new HttpError(400, 'invalid_request', 'intake.allowlist is only valid when intake.mode is "allowlist"');
+  }
+  return { mode, allowlist: parseIdList(value.allowlist, 'intake.allowlist') };
 }
 
-export function parseAllowlist(value: unknown): string[] | null {
-  if (value === undefined || value === null) return null;
+export function parseIdList(value: unknown, field: string): string[] {
   if (!Array.isArray(value)) {
-    throw new HttpError(400, 'invalid_request', 'allowlist must be an array of bot ids, or null to accept anyone');
+    throw new HttpError(400, 'invalid_request', `${field} must be an array of bot ids`);
   }
   if (value.length > 100) {
-    throw new HttpError(400, 'invalid_request', 'allowlist cannot contain more than 100 ids');
+    throw new HttpError(400, 'invalid_request', `${field} cannot contain more than 100 ids`);
   }
-  const ids = value.map((entry, index) => parseBotId(entry, `allowlist[${index}]`));
+  const ids = value.map((entry, index) => parseBotId(entry, `${field}[${index}]`));
   return [...new Set(ids)];
 }
 
@@ -116,7 +107,7 @@ export function parseHeaderName(value: unknown): string {
     throw new HttpError(
       400,
       'invalid_request',
-      'auth_header_name must be a header name and cannot replace Content-Type or the relay signature headers',
+      'webhook_auth_name must be a header name and cannot replace Content-Type or registry headers',
     );
   }
   return value;
@@ -124,52 +115,7 @@ export function parseHeaderName(value: unknown): string {
 
 export function parseHeaderValue(value: unknown): string {
   if (typeof value !== 'string' || value.length < 1 || value.length > 4096 || /[\r\n\0]/.test(value)) {
-    throw new HttpError(400, 'invalid_request', 'auth_header_value must be 1-4096 characters without newlines');
+    throw new HttpError(400, 'invalid_request', 'webhook_auth_value must be 1-4096 characters without newlines');
   }
   return value;
-}
-
-export function parseIdempotencyKey(value: string): string {
-  if (!/^[A-Za-z0-9._:-]{1,200}$/.test(value)) {
-    throw new HttpError(
-      400,
-      'invalid_request',
-      'Idempotency-Key must be 1-200 characters of letters, digits, ".", "_", ":", or "-"',
-    );
-  }
-  return value;
-}
-
-export function parseLimit(raw: string | undefined): number {
-  if (raw === undefined || raw === '') return 50;
-  if (!/^\d+$/.test(raw)) throw new HttpError(400, 'invalid_request', 'limit must be an integer');
-  const value = Number(raw);
-  if (value < 1 || value > 100) throw new HttpError(400, 'invalid_request', 'limit must be between 1 and 100');
-  return value;
-}
-
-export function requestHash(input: SendInput): string {
-  const canonical = stableStringify({
-    to: input.to,
-    body: input.body,
-    thread_id: input.threadId,
-    reply_to: input.replyTo,
-    metadata: input.metadata,
-  });
-  return createHash('sha256').update(canonical).digest('hex');
-}
-
-function assertDepth(value: unknown, depth: number): void {
-  if (depth > 8) throw new HttpError(400, 'invalid_request', 'metadata is nested too deeply');
-  if (value && typeof value === 'object') {
-    for (const child of Object.values(value as object)) assertDepth(child, depth + 1);
-  }
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map((entry) => stableStringify(entry)).join(',')}]`;
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(obj[key])}`).join(',')}}`;
 }

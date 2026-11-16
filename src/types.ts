@@ -1,111 +1,38 @@
-export type BotKind = 'relay' | 'a2a';
+export type IntakeMode = 'open' | 'allowlist' | 'none';
 
 export type Bot = {
   id: string;
   displayName: string;
-  webhookUrl: string | null;
-  authHeaderName: string | null;
-  authHeaderValueEnc: string | null;
+  /** Free-text capability description shown in the directory. */
+  capabilities: string;
+  /** Encoded webhook URL (AES-256-GCM). Contact details never appear in plaintext columns. */
+  webhookUrlEnc: string;
+  webhookAuthName: string;
+  /** Encoded webhook auth value (AES-256-GCM). Empty string when no auth header is set. */
+  webhookAuthValueEnc: string;
   tokenHash: string;
-  /** null means any registered bot may send. An empty array means nobody may send. */
-  allowlist: string[] | null;
-  kind: BotKind;
-  a2aCardUrl: string | null;
-  a2aEndpoint: string | null;
-  a2aInboundTokenHash: string | null;
-  acceptA2a: boolean;
-  /** Where the stored outbound credential is attached. */
-  a2aAuthIn: 'header' | 'query' | null;
-  a2aTenant: string | null;
+  tokenSetAt: number;
+  /** Non-null marks the access token as revoked; every authenticated call then fails. */
+  tokenRevokedAt: number | null;
   disabled: boolean;
+  intakeMode: IntakeMode;
+  /** Bot ids allowed to open inquiries; only meaningful in allowlist mode. */
+  intakeAllowlist: string[] | null;
+  /** Bumped whenever webhook_url or webhook_auth_value changes. */
+  contactVersion: number;
+  webhookSecretSetAt: number;
   createdAt: number;
   updatedAt: number;
+  /** Last call that passed token auth, for the admin "recent activity" view. */
+  lastSeenAt: number | null;
 };
 
-export type MessageStatus = 'pending' | 'delivering' | 'delivered' | 'failed' | 'inbox';
-
-export type Message = {
-  id: string;
-  fromId: string;
-  toId: string;
-  threadId: string;
-  replyTo: string | null;
-  body: string;
-  metadata: unknown | null;
-  hop: number;
-  status: MessageStatus;
-  attempts: number;
-  lastError: string | null;
-  nextAttemptAt: number | null;
-  createdAt: number;
-  deliveredAt: number | null;
-  inboxAckedAt: number | null;
+export type NewBot = Omit<Bot, 'contactVersion' | 'webhookSecretSetAt'> & {
+  contactVersion?: number;
+  webhookSecretSetAt?: number;
 };
 
-export type NewMessage = {
-  id: string;
-  fromId: string;
-  toId: string;
-  threadId: string;
-  replyTo: string | null;
-  body: string;
-  metadata: unknown | null;
-  hop: number;
-  status: 'pending' | 'inbox';
-  nextAttemptAt: number | null;
-  createdAt: number;
-};
-
-export type DeliveryAttempt = {
-  attempt: number;
-  statusCode: number | null;
-  error: string | null;
-  createdAt: number;
-};
-
-export type SendInput = {
-  to: string;
-  body: string;
-  threadId: string | null;
-  replyTo: string | null;
-  metadata: unknown | null;
-};
-
-export type IdempotencyRecord = {
-  messageId: string;
-  requestHash: string;
-};
-
-export type NewBot = {
-  id: string;
-  displayName: string;
-  webhookUrl: string | null;
-  authHeaderName: string | null;
-  authHeaderValueEnc: string | null;
-  tokenHash: string;
-  allowlist: string[] | null;
-  kind: BotKind;
-  a2aCardUrl: string | null;
-  a2aEndpoint: string | null;
-  a2aInboundTokenHash: string | null;
-  acceptA2a: boolean;
-  a2aAuthIn: 'header' | 'query' | null;
-  a2aTenant: string | null;
-  createdAt: number;
-  updatedAt: number;
-};
-
-export type BotPatch = {
-  displayName?: string;
-  webhookUrl?: string | null;
-  authHeaderName?: string | null;
-  authHeaderValueEnc?: string | null;
-  allowlist?: string[] | null;
-  tokenHash?: string;
-  acceptA2a?: boolean;
-  a2aInboundTokenHash?: string | null;
-  disabled?: boolean;
-};
+export type BotPatch = Partial<Omit<Bot, 'id' | 'createdAt'>>;
 
 export type Invite = {
   id: number;
@@ -118,35 +45,38 @@ export type Invite = {
   createdAt: number;
 };
 
-export type A2aDirection = 'inbound' | 'outbound';
+export type InquiryStatus = 'delivering' | 'pending' | 'approved' | 'rejected' | 'expired' | 'undelivered';
 
-export type A2aTask = {
+export type Inquiry = {
   id: string;
-  direction: A2aDirection;
-  botId: string;
-  contextId: string | null;
-  threadId: string;
-  relayMessageId: string | null;
-  state: string;
-  remoteMessageId: string | null;
-  requestText: string;
-  responseText: string | null;
-  history: unknown[];
+  requesterId: string;
+  targetId: string;
+  status: InquiryStatus;
   createdAt: number;
-  updatedAt: number;
+  expiresAt: number;
+  deliveredAt: number | null;
+  decidedAt: number | null;
+  deliveryError: string | null;
 };
 
-export type NewA2aTask = {
+export type Grant = {
   id: string;
-  direction: A2aDirection;
-  botId: string;
-  contextId: string | null;
-  threadId: string;
-  relayMessageId: string | null;
-  state: string;
-  remoteMessageId: string | null;
-  requestText: string;
-  responseText: string | null;
-  history: unknown[];
-  createdAt: number;
+  requesterId: string;
+  targetId: string;
+  inquiryId: string;
+  grantedAt: number;
+  revokedAt: number | null;
+  abandonedAt: number | null;
+  refreshedAt: number | null;
+  refreshedContactVersion: number | null;
+};
+
+export type AuditEvent = {
+  id: number;
+  at: number;
+  actor: string;
+  action: string;
+  object: string | null;
+  detail: string | null;
+  source: string | null;
 };

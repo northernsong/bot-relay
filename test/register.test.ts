@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { api, ADMIN, expectStatus, makeApp, startWebhook } from './helpers.js';
+import { ADMIN, api, createInvite, expectStatus, login, makeApp } from './helpers.js';
 
 const open: Array<{ close: () => void | Promise<void> }> = [];
 
@@ -11,178 +11,182 @@ afterEach(async () => {
   }
 });
 
-describe('registration and auth', () => {
-  it('requires the admin token and returns a relay token without the webhook secret', async () => {
-    const hook = await startWebhook();
+const WEBHOOK = 'http://127.0.0.1:9/hook/secret-path';
+
+async function register(app: Parameters<typeof api>[0], body: Record<string, unknown>) {
+  return api(app, '/v1/register', { body });
+}
+
+describe('registration', () => {
+  it('returns a br_ token exactly once and the owner profile with contact details', async () => {
     const { app, deps } = makeApp();
-    open.push({ close: () => deps.db.close() }, hook);
-    const secret = 'super-secret-webhook-key';
+    open.push({ close: () => deps.db.close() });
+    const session = await login(app);
+    const invite = await createInvite(app, session);
 
-    const missing = await api(app, '/bots', { body: { id: 'alice', display_name: 'Alice' } });
-    expectStatus(missing, 401);
-
-    const asBotWould = await api(app, '/bots', {
-      token: 'rl_not-a-real-token',
-      body: { id: 'alice', display_name: 'Alice' },
-    });
-    expectStatus(asBotWould, 401);
+    const missing = await register(app, { id: 'alice', display_name: 'Alice', webhook_url: WEBHOOK });
+    expectStatus(missing, 403);
+    expect(missing.json.error.code).toBe('invite_invalid');
 
     const created = expectStatus(
-      await api(app, '/bots', {
-        token: ADMIN,
-        body: {
-          id: 'alice',
-          display_name: 'Alice',
-          webhook_url: `${hook.url}/super-secret-path`,
-          auth_header_name: 'Authorization',
-          auth_header_value: `Bearer ${secret}`,
-          allowlist: ['bob'],
-        },
+      await register(app, {
+        invite_code: invite.code,
+        id: 'alice',
+        display_name: 'Alice',
+        capabilities: 'weather reports',
+        webhook_url: WEBHOOK,
+        webhook_auth_name: 'Authorization',
+        webhook_auth_value: 'Bearer super-secret',
       }),
       201,
     );
-    expect(created.token).toMatch(/^rl_/);
-    expect(created.has_auth_header).toBe(true);
-    expect(created.auth_header_name).toBe('Authorization');
-    expect(created.webhook_url).toContain('/hook/super-secret-path');
-    expect(JSON.stringify(created)).not.toContain(secret);
-    expect(created).not.toHaveProperty('auth_header_value');
+    expect(created.token).toMatch(/^br_/);
+    expect(created.bot.id).toBe('alice');
+    expect(created.bot.display_name).toBe('Alice');
+    expect(created.bot.capabilities).toBe('weather reports');
+    expect(created.bot.webhook_url).toBe(WEBHOOK);
+    expect(created.bot.webhook_auth_name).toBe('Authorization');
+    expect(created.bot.webhook_auth_value).toBe('Bearer super-secret');
+    expect(created.bot.intake).toEqual({ mode: 'open' });
+    expect(created.bot.contact_version).toBe(1);
+    expect(created.bot.disabled).toBe(false);
+    expect(created.bot.token_set_at).toBeTruthy();
+    expect(created.bot.created_at).toBeTruthy();
+    expect(created.bot).not.toHaveProperty('token_hash');
 
-    const stored = deps.db.getBot('alice');
-    expect(stored?.authHeaderValueEnc).toBeTruthy();
-    expect(stored?.authHeaderValueEnc).not.toContain(secret);
-
-    const me = expectStatus(await api(app, '/bots/me', { token: created.token }), 200);
-    expect(me.id).toBe('alice');
-    expect(me).not.toHaveProperty('token');
-    expect(JSON.stringify(me)).not.toContain(secret);
-
-    const again = await api(app, '/bots', {
-      token: ADMIN,
-      body: { id: 'alice', display_name: 'Alice again' },
+    const taken = await register(app, {
+      invite_code: (await createInvite(app, session)).code,
+      id: 'alice',
+      display_name: 'Alice 2',
+      webhook_url: WEBHOOK,
     });
-    expectStatus(again, 409);
+    expectStatus(taken, 409);
+    expect(taken.json.error.code).toBe('id_taken');
 
-    const unauth = await api(app, '/health');
-    expectStatus(unauth, 200);
-    expect(unauth.json.ok).toBe(true);
+    const unknown = await register(app, {
+      invite_code: (await createInvite(app, session)).code,
+      id: 'bob',
+      display_name: 'Bob',
+      webhook_url: WEBHOOK,
+      hop_limit: 5,
+    });
+    expectStatus(unknown, 400);
+    expect(unknown.json.error.code).toBe('invalid_request');
+
+    const health = await api(app, '/health');
+    expectStatus(health, 200);
+    expect(health.json.ok).toBe(true);
   });
 
-  it('rejects bad ids and updates or deletes only the caller', async () => {
+  it('rejects bad ids, reserved ids, and invalid profile fields', async () => {
     const { app, deps } = makeApp();
     open.push({ close: () => deps.db.close() });
-    const alice = expectStatus(
-      await api(app, '/bots', { token: ADMIN, body: { id: 'alice', display_name: 'Alice' } }),
-      201,
-    );
-    expectStatus(await api(app, '/bots', { token: ADMIN, body: { id: 'Alice', display_name: 'No' } }), 400);
-    expectStatus(await api(app, '/bots', { token: ADMIN, body: { id: 'me', display_name: 'No' } }), 400);
+    const session = await login(app);
+    const base = async (overrides: Record<string, unknown>) => {
+      const invite = await createInvite(app, session);
+      const result = await register(app, {
+        invite_code: invite.code,
+        id: 'alice',
+        display_name: 'Alice',
+        webhook_url: WEBHOOK,
+        ...overrides,
+      });
+      return result;
+    };
+    expectStatus(await base({ id: 'Alice' }), 400);
+    expectStatus(await base({ id: 'me' }), 400);
+    expectStatus(await base({ id: 'admin' }), 400);
+    expectStatus(await base({ id: 'registry' }), 400);
+    expectStatus(await base({ id: 'x' }), 400);
+    expectStatus(await base({ id: 'a'.repeat(33) }), 400);
+    expectStatus(await base({ display_name: '' }), 400);
+    expectStatus(await base({ display_name: 'x'.repeat(81) }), 400);
+    expectStatus(await base({ capabilities: 'y'.repeat(501) }), 400);
+    expectStatus(await base({ webhook_url: 'not-a-url' }), 400);
+    expectStatus(await base({ webhook_url: 'ftp://example.com/hook' }), 400);
+    expectStatus(await base({ webhook_auth_name: 'Authorization' }), 400);
+    expectStatus(await base({ webhook_auth_value: 'Bearer x' }), 400);
+    expectStatus(await base({ webhook_auth_name: 'Content-Type', webhook_auth_value: 'x' }), 400);
+    expectStatus(await base({ intake: 'open' }), 400);
+    expectStatus(await base({ intake: { mode: 'weird' } }), 400);
 
-    const patched = expectStatus(
-      await api(app, '/bots/me', {
-        method: 'PATCH',
-        token: alice.token,
-        body: { display_name: 'Alice Updated', allowlist: [] },
-      }),
-      200,
-    );
-    expect(patched.display_name).toBe('Alice Updated');
-    expect(patched.allowlist).toEqual([]);
-    expect(patched).not.toHaveProperty('token');
-
-    const rotated = expectStatus(
-      await api(app, '/bots/me', { method: 'PATCH', token: alice.token, body: { rotate_token: true } }),
-      200,
-    );
-    expect(rotated.token).toMatch(/^rl_/);
-    expect(rotated.token).not.toBe(alice.token);
-    expectStatus(await api(app, '/bots/me', { token: alice.token }), 401);
-    expectStatus(await api(app, '/bots/me', { token: rotated.token }), 200);
-
-    expectStatus(await api(app, '/messages', { token: ADMIN, body: { to: 'alice', body: 'nope' } }), 401);
-
-    expectStatus(await api(app, '/bots/me', { method: 'DELETE', token: rotated.token }), 200);
-    expectStatus(await api(app, '/bots/me', { token: rotated.token }), 401);
-
-    const bob = expectStatus(
-      await api(app, '/bots', { token: ADMIN, body: { id: 'bob', display_name: 'Bob' } }),
-      201,
-    );
-    const carol = expectStatus(
-      await api(app, '/bots', { token: ADMIN, body: { id: 'carol', display_name: 'Carol' } }),
-      201,
-    );
-    expectStatus(await api(app, `/bots/${bob.id}`, { method: 'DELETE', token: ADMIN }), 200);
-    expectStatus(await api(app, '/bots/bob', { token: carol.token }), 404);
+    // A valid registration still works after all the rejects above.
+    expectStatus(await base({ id: 'valid-bot' }), 201);
   });
 
-  it('does not publish another bot webhook URL or allowlist', async () => {
+  it('validates the intake three-state control', async () => {
     const { app, deps } = makeApp();
     open.push({ close: () => deps.db.close() });
-    const alice = expectStatus(
-      await api(app, '/bots', {
-        token: ADMIN,
-        body: {
-          id: 'alice',
-          display_name: 'Alice',
-          webhook_url: 'http://127.0.0.1:9/hooks/super-secret-path',
-          auth_header_name: 'X-Webhook-Secret',
-          auth_header_value: 'super-secret-webhook-key',
-          allowlist: ['bob'],
-        },
+    const session = await login(app);
+    const invite = await createInvite(app, session);
+    expectStatus(
+      await register(app, {
+        invite_code: invite.code,
+        id: 'bob',
+        display_name: 'Bob',
+        webhook_url: WEBHOOK,
+        intake: { mode: 'allowlist' },
+      }),
+      400,
+    );
+    expectStatus(
+      await register(app, {
+        invite_code: (await createInvite(app, session)).code,
+        id: 'bob',
+        display_name: 'Bob',
+        webhook_url: WEBHOOK,
+        intake: { mode: 'open', allowlist: ['carol'] },
+      }),
+      400,
+    );
+
+    const created = expectStatus(
+      await register(app, {
+        invite_code: (await createInvite(app, session)).code,
+        id: 'bob',
+        display_name: 'Bob',
+        webhook_url: WEBHOOK,
+        intake: { mode: 'allowlist', allowlist: ['carol', 'carol', 'dave'] },
       }),
       201,
     );
-    const bob = expectStatus(
-      await api(app, '/bots', { token: ADMIN, body: { id: 'bob', display_name: 'Bob' } }),
+    expect(created.bot.intake).toEqual({ mode: 'allowlist', allowlist: ['carol', 'dave'] });
+    const stored = deps.db.getBot('bob');
+    expect(stored?.intakeMode).toBe('allowlist');
+    expect(stored?.intakeAllowlist).toEqual(['carol', 'dave']);
+
+    const none = expectStatus(
+      await register(app, {
+        invite_code: (await createInvite(app, session)).code,
+        id: 'carol',
+        display_name: 'Carol',
+        webhook_url: WEBHOOK,
+        intake: { mode: 'none' },
+      }),
       201,
     );
-    const profile = expectStatus(await api(app, '/bots/alice', { token: bob.token }), 200);
-    expect(profile).toEqual({ id: 'alice', display_name: 'Alice', delivery: 'webhook' });
-    expect(JSON.stringify(profile)).not.toContain('super-secret');
-    expect(profile).not.toHaveProperty('allowlist');
-    expect(profile).not.toHaveProperty('webhook_url');
-    expect(alice.has_auth_header).toBe(true);
+    expect(none.bot.intake).toEqual({ mode: 'none' });
   });
 
-  it('clears a webhook auth header without echoing the new value', async () => {
-    const hook = await startWebhook();
+  it('requires a JSON body', async () => {
     const { app, deps } = makeApp();
-    open.push({ close: () => deps.db.close() }, hook);
-    const alice = expectStatus(
-      await api(app, '/bots', {
-        token: ADMIN,
-        body: {
-          id: 'alice',
-          display_name: 'Alice',
-          webhook_url: hook.url,
-          auth_header_name: 'X-Webhook-Secret',
-          auth_header_value: 'first-secret',
-        },
-      }),
-      201,
-    );
-    const updated = expectStatus(
-      await api(app, '/bots/me', {
-        method: 'PATCH',
-        token: alice.token,
-        body: { auth_header_value: 'second-secret' },
-      }),
-      200,
-    );
-    expect(updated.has_auth_header).toBe(true);
-    expect(JSON.stringify(updated)).not.toContain('second-secret');
-    expect(deps.db.getBot('alice')?.authHeaderValueEnc).not.toContain('second-secret');
+    open.push({ close: () => deps.db.close() });
+    const res = await app.request('/v1/register', {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: 'invite_code=abc',
+    });
+    expect(res.status).toBe(415);
+  });
 
-    const cleared = expectStatus(
-      await api(app, '/bots/me', {
-        method: 'PATCH',
-        token: alice.token,
-        body: { auth_header_name: null },
-      }),
-      200,
-    );
-    expect(cleared.has_auth_header).toBe(false);
-    expect(cleared.auth_header_name).toBeNull();
+  it('admin bearer cannot bypass the invite requirement', async () => {
+    const { app, deps } = makeApp();
+    open.push({ close: () => deps.db.close() });
+    const result = await api(app, '/v1/register', {
+      token: ADMIN,
+      body: { id: 'alice', display_name: 'Alice', webhook_url: WEBHOOK },
+    });
+    expectStatus(result, 403);
+    expect(result.json.error.code).toBe('invite_invalid');
   });
 });

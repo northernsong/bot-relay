@@ -12,6 +12,7 @@ export const adminCss = `
 body { margin: 0; background: #f4f1ea; color: #1c1915; }
 header, main { max-width: 960px; margin: 0 auto; padding: 24px; }
 h1 { font-size: 1.6rem; margin: 0 0 8px; }
+h2 { font-size: 1.15rem; }
 p, li { line-height: 1.45; }
 table { width: 100%; border-collapse: collapse; background: #fffdf8; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e4dccb; font-size: 0.95rem; vertical-align: top; }
@@ -46,8 +47,8 @@ export function dashboardPage(csrf: string): string {
     <main>
       <section>
         <h2>Bots</h2>
-        <p class="note">Webhook URLs, relay tokens, and stored credentials are not shown.</p>
-        <table id="bots"><thead><tr><th>Id</th><th>Name</th><th>Delivery</th><th>Status</th><th>Messages</th><th>Deliveries</th><th></th></tr></thead><tbody></tbody></table>
+        <p class="note">Webhook URLs and stored credentials are not shown.</p>
+        <table id="bots"><thead><tr><th>Id</th><th>Name</th><th>Status</th><th>Last activity</th><th>Token set</th><th></th></tr></thead><tbody></tbody></table>
       </section>
       <section>
         <h2>Invite codes</h2>
@@ -68,14 +69,15 @@ export function dashboardPage(csrf: string): string {
 export function registerPage(code: string): string {
   return layout('Register a bot', `
     <h1>Register a bot</h1>
-    <p class="note">You need an invite code. The relay token is shown once.</p>
+    <p class="note">You need an invite code. The bot access token is shown once.</p>
     <form class="login" id="register-form">
       <label>Invite code <input name="invite_code" required value="${escapeHtml(code)}"></label>
       <label>Bot id <input name="id" required pattern="[a-z0-9][a-z0-9_-]{1,31}" placeholder="alice"></label>
       <label>Display name <input name="display_name" required maxlength="80"></label>
-      <label>Webhook URL <input name="webhook_url" placeholder="optional https URL"></label>
-      <label>Auth header name <input name="auth_header_name" placeholder="Authorization"></label>
-      <label>Auth header value <input name="auth_header_value" placeholder="Bearer ..."></label>
+      <label>Capabilities <input name="capabilities" maxlength="500" placeholder="what this bot can do"></label>
+      <label>Webhook URL <input name="webhook_url" required placeholder="https://example.com/hook"></label>
+      <label>Webhook auth header name <input name="webhook_auth_name" placeholder="Authorization"></label>
+      <label>Webhook auth header value <input name="webhook_auth_value" placeholder="Bearer ..."></label>
       <button type="submit">Register</button>
     </form>
     <pre id="result" class="note"></pre>
@@ -99,7 +101,7 @@ async function loadBots() {
   const data = await api('/admin/api/bots');
   for (const bot of data.bots) {
     const tr = document.createElement('tr');
-    tr.append(cell(bot.id), cell(bot.display_name), cell(bot.delivery), cell(bot.disabled ? 'disabled' : 'active'), cell(bot.message_count), cell(bot.delivery_count));
+    tr.append(cell(bot.id), cell(bot.display_name), cell(bot.disabled ? 'disabled' : 'active'), cell(bot.last_seen_at || 'never'), cell(bot.token_set_at));
     const actions = document.createElement('td');
     const toggle = document.createElement('button');
     toggle.textContent = bot.disabled ? 'Enable' : 'Disable';
@@ -163,11 +165,11 @@ document.querySelector('#register-form').onsubmit = async (event) => {
   const form = new FormData(event.target);
   const payload = Object.fromEntries(form.entries());
   for (const key of Object.keys(payload)) if (payload[key] === '') delete payload[key];
-  const res = await fetch('/register', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) });
+  const res = await fetch('/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) });
   const data = await res.json().catch(() => ({}));
   const box = document.querySelector('#result');
   if (!res.ok) { box.textContent = (data.error && data.error.message) || 'Registration failed'; return; }
-  box.textContent = 'Copy these now. They will not be shown again.\\nrelay token: ' + data.token + '\\na2a token: ' + (data.a2a_token || '');
+  box.textContent = 'Copy this now. It will not be shown again.\\nbot access token: ' + data.token;
 };
 `;
 

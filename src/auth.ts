@@ -24,11 +24,20 @@ export function requireAdmin(deps: Deps, header: string | undefined): void {
 export function requireBot(deps: Deps, header: string | undefined): Bot {
   const token = readBearer(header);
   if (!token) {
-    throw new HttpError(401, 'unauthorized', 'Relay token required', { 'www-authenticate': 'Bearer' });
+    throw new HttpError(401, 'unauthorized', 'Bot token required', { 'www-authenticate': 'Bearer' });
   }
   const bot = deps.db.getBotByTokenHash(hashToken(token));
-  if (!bot) {
-    throw new HttpError(401, 'unauthorized', 'Relay token required', { 'www-authenticate': 'Bearer' });
+  if (!bot || bot.tokenRevokedAt !== null) {
+    throw new HttpError(401, 'unauthorized', 'Bot token required', { 'www-authenticate': 'Bearer' });
+  }
+  return bot;
+}
+
+/** Business endpoints (everything except self-status) reject disabled bots. */
+export function requireActiveBot(deps: Deps, header: string | undefined): Bot {
+  const bot = requireBot(deps, header);
+  if (bot.disabled) {
+    throw new HttpError(403, 'bot_disabled', 'This bot is disabled');
   }
   return bot;
 }
