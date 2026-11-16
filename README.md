@@ -1,485 +1,60 @@
 # bot-relay
 
-**先看哪一份文档**
+自托管的 **Bot（Agent）注册中心**：Bot 凭邀请码注册、在目录里互相发现、
+通过「询问 → 亲自同意」交换 webhook 联系方式，然后**点对点直连互调**。
+注册中心不在通话路径上——它不接收、不转发、不存储任何消息。
 
-| 你是谁 | 读这份 |
-| --- | --- |
-| 开发者或项目所有者：看懂架构、在本机把服务跑起来、用管理台和 HTTP 发出第一条消息 | **[架构与使用指南（简体中文）](docs/ARCHITECTURE_AND_USAGE.md)** |
-| 要写接入程序的 Agent：按路由、字段和错误码对接一台正在运行的中继 | [集成契约](docs/INTEGRATION.md) |
+> 本仓库正处于重设计后的纯注册中心形态（阶段 A–D 已交付），**不兼容**旧 0.1.0
+> 中继/A2A 实例：升级 = 新库新部署，所有 Bot 凭新邀请码重新注册。
 
-两份文档互补。前者讲人怎么看懂架构和上手使用，后者是程序对接时的接口契约。部署命令、签名示例，以及 Grok Bot / A2A 的简版说明仍在本 README 后文。
+## 文档
 
-bot-relay is a small self-hosted service that lets assistant bots message each other. A bot registers its webhook, receives a relay token, and sends messages with a normal HTTP call. The relay fills in the sender, enforces an allowlist, a per-sender rate limit, and a per-thread hop limit, then forwards a signed JSON envelope to the recipient. A bot with no webhook can poll an inbox instead.
-
-It is bot-agnostic. Grok Bot is the first intended client, because a Grok routine can wake up on an HTTPS webhook and can also make plain HTTP calls, but any program that can do those two things can participate.
-
-**Connecting a bot or an A2A agent?** Read [docs/INTEGRATION.md](docs/INTEGRATION.md) and follow it against the relay origin (for example `https://relay.songyang.xyz`). That guide is the self-contained contract: invite and admin registration, the one-time `token` and `a2a_token`, webhook push, `GET /inbox`, `POST /messages`, and A2A 1.0 JSON-RPC in both directions. The rest of this README is how to run the service.
-
-**Stack.** TypeScript on Node.js 22, [Hono](https://hono.dev) for HTTP, and Node's built-in `node:sqlite`. Hono is a small router that is easy to test without binding a port. SQLite is one file, so a laptop, a VPS directory, a Fly volume, or a Railway volume is enough. There is no native addon to compile. Node still prints an experimental warning for `node:sqlite`; the API is stable enough for this service and the warning is harmless.
-
-## 中文简介
-
-bot-relay 是一个可自托管的中转服务，让不同账号里的 AI 助手通过 webhook 互相发消息。部署者用环境变量里的邀请令牌（`ADMIN_TOKEN`）控制谁可以注册。机器人注册自己的 webhook 和调用该 webhook 所需的鉴权头，拿到一次性返回的 relay token，之后用 `POST /messages` 发消息。中继会自己填写发送方，并检查收件人白名单、发送频率和会话跳数，再把带 HMAC-SHA256 签名的 JSON 投递给对方。没有 webhook 的机器人可以轮询 `GET /inbox`。
-
-请把收到的 `body` 当作不可信输入。不要让另一个机器人在未经你本人确认的情况下触发敏感操作、外部工具或账号变更。本服务也实现了 A2A 协议 1.0（规范补丁 1.0.1）：每个已注册的机器人会暴露一张 Agent Card，外部 A2A 代理可以按卡片 URL 注册进来。要接入一台正在运行的中继（例如 `https://relay.songyang.xyz`），直接按 [docs/INTEGRATION.md](docs/INTEGRATION.md) 做。下文是部署、签名校验、Grok Bot 和 A2A 的说明。
-
-## How it fits together
-
-```mermaid
-flowchart LR
-  BotA["Bot A"] -->|relay token| Relay["bot-relay"]
-  BotB["Bot B"] -->|relay token| Relay
-  Relay --> DB[("SQLite")]
-  Relay -->|signed POST| HookA["Bot A webhook"]
-  Relay -->|signed POST| HookB["Bot B webhook"]
-```
-
-```mermaid
-sequenceDiagram
-  participant A as Bot A
-  participant R as bot-relay
-  participant B as Bot B webhook
-  A->>R: POST /messages with the relay token
-  Note over R: Sets from. Checks allowlist, rate limit, and hop count
-  R->>B: POST the signed envelope, plus the recipient auth header
-  B-->>R: 2xx
-  R-->>A: 202 delivered
-```
-
-Registration is the only route that uses `ADMIN_TOKEN`. Everything a bot does uses the relay token returned at registration. The relay never trusts a `from` field from the client. That field is not even accepted.
-
-## Quickstart
-
-Requires Node.js 22.13 or newer.
-
-```bash
-git clone https://github.com/northernsong/bot-relay.git
-cd bot-relay
-npm install
-export ADMIN_TOKEN="$(openssl rand -hex 24)"
-export RELAY_SECRET="$(openssl rand -hex 32)"
-npm run dev
-```
-
-`npm run dev` listens on port 8080 (override with `PORT`). In another shell, with the same `ADMIN_TOKEN` exported:
-
-```bash
-BASE=http://127.0.0.1:8080
-
-alice=$(curl -s -X POST "$BASE/bots" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"alice","display_name":"Alice"}')
-ALICE_TOKEN=$(node -e 'console.log(JSON.parse(process.argv[1]).token)' "$alice")
-
-bob=$(curl -s -X POST "$BASE/bots" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"id":"bob","display_name":"Bob"}')
-BOB_TOKEN=$(node -e 'console.log(JSON.parse(process.argv[1]).token)' "$bob")
-
-curl -s -X POST "$BASE/messages" \
-  -H "Authorization: Bearer $ALICE_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: hello-1" \
-  -d '{"to":"bob","body":"Hello Bob"}'
-
-curl -s "$BASE/inbox" -H "Authorization: Bearer $BOB_TOKEN"
-```
-
-Bob's inbox contains the message, including `thread_id` and `id`. Bob replies on that thread:
-
-```bash
-curl -s -X POST "$BASE/messages" \
-  -H "Authorization: Bearer $BOB_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"to":"alice","body":"Hello Alice","thread_id":"THREAD_ID_FROM_THE_INBOX","reply_to":"MESSAGE_ID"}'
-```
-
-Alice then reads `GET /inbox`. Repeating the same `Idempotency-Key` with the same payload returns the original message and does not deliver it again. The response carries `Idempotent-Replayed: true`.
-
-Docker Compose is the same service with a volume for the database. Copy `.env.example` to `.env`, set the two secrets, then:
-
-```bash
-docker compose up --build
-```
-
-The Compose file hard-codes the published port `8080:8080` and the container values `PORT=8080`, `HOST=0.0.0.0`, and `DATABASE_PATH=/data/bot-relay.sqlite`. Changing `PORT` in `.env` does not move that mapping. `.env` is interpolated only for `ADMIN_TOKEN`, `RELAY_SECRET`, `MAX_HOPS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_SEC`, `ALLOW_HTTP_WEBHOOKS`, and `ALLOW_PRIVATE_WEBHOOKS`. The full list, including variables Compose does not pass through, is in [section 6.1 of the architecture guide](docs/ARCHITECTURE_AND_USAGE.md#61-环境变量).
-
-## Connecting a Grok Bot
-
-Grok Bot can run a routine when something calls an HTTPS webhook, and it can make ordinary HTTP calls. That is the whole integration.
-
-1. Create a webhook-triggered routine in the Grok Bot app. Copy the webhook URL and the secret key the app shows you.
-2. Register that URL with bot-relay. The exact header Grok expects is chosen in the app and is not fixed here, so you store the header name and value yourself. If the app says to send `Authorization: Bearer <key>`, use those. If it says to send a different header, put that name and value in the registration instead. The value is encrypted at rest and is never returned by the API.
-
-```bash
-curl -s -X POST "$BASE/bots" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "my-grok",
-    "display_name": "My Grok",
-    "webhook_url": "https://the-webhook-url-from-the-app",
-    "auth_header_name": "Authorization",
-    "auth_header_value": "Bearer PASTE_THE_KEY_FROM_THE_APP"
-  }'
-```
-
-Save the `token` from the response. That is this bot's relay token. The webhook key will not be in the response.
-
-3. Send to another registered bot with curl, or from the bot itself (it can make plain HTTP calls):
-
-```bash
-curl -s -X POST "$BASE/messages" \
-  -H "Authorization: Bearer $RELAY_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: greeting-1" \
-  -d '{"to":"other-grok","body":"Hello from my Grok"}'
-```
-
-4. In the receiving routine, verify `X-Bot-Relay-Signature` against the raw body before trusting the payload, and ignore a message id you have already seen. Treat `body` as untrusted text from another bot. Do not let that bot trigger sensitive tools, spend money, change account settings, or take any other action a human should approve. Show the message to the human, or limit the routine to a clearly safe reply.
-
-If you do not have a webhook yet, omit `webhook_url` and poll `GET /inbox` with the relay token. You can add a webhook later with `PATCH /bots/me`.
-
-Give each Grok account its own registration. They only need each other's bot id, not each other's webhook key or relay token.
-
-## A2A (Agent2Agent)
-
-The step-by-step client contract, including every JSON-RPC method, header, and error code, is [docs/INTEGRATION.md](docs/INTEGRATION.md#mode-b--a2a-10). This section is the short version.
-
-bot-relay speaks [A2A protocol 1.0](https://a2a-protocol.org/latest/specification/) (specification patch [1.0.1](https://github.com/a2aproject/A2A/releases/tag/v1.0.1)). JSON uses the proto JSON names (`ROLE_USER`, `TASK_STATE_COMPLETED`, `supportedInterfaces`). The binding is JSON-RPC 2.0. Clients must send `A2A-Version: 1.0` (a missing header is 0.3, which this server rejects). `SendMessage` / `GetTask` are the 1.0 method names; `message/send`, `tasks/get`, and `message/stream` are accepted as aliases.
-
-```mermaid
-sequenceDiagram
-  participant E as External A2A client
-  participant R as bot-relay
-  participant B as Bot webhook or inbox
-  E->>R: JSON-RPC SendMessage, A2A-Version 1.0
-  R->>B: Signed relay message, from a2a
-  B->>R: POST /messages to a2a with thread_id
-  R-->>E: Task COMPLETED, text artifact
-```
-
-### Inbound: a relay bot as an A2A agent
-
-Registration returns `a2a_token` once, next to the relay `token`. The Agent Card is public:
-
-```text
-GET /a2a/bots/alice/.well-known/agent-card.json
-```
-
-There is one card per bot, not one card for the whole relay. `supportedInterfaces[0].url` is an absolute URL, `{PUBLIC_BASE_URL or the request origin}/a2a/bots/alice`. Call that URL with `POST`. The card declares HTTP Bearer auth with `a2a_token`, streaming, and no push notifications. A non-empty pathname on `PUBLIC_BASE_URL` is included in that URL and in invite `register_url` values; the process routes stay `/a2a/...` and `/register`, so the reverse proxy has to forward the prefix.
-
-```bash
-curl -s -X POST "$BASE/a2a/bots/alice" \
-  -H "Authorization: Bearer $A2A_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "A2A-Version: 1.0" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "SendMessage",
-    "params": {
-      "message": {
-        "role": "ROLE_USER",
-        "messageId": "greeting-1",
-        "parts": [{ "text": "What should we tell the human?" }]
-      }
-    }
-  }'
-```
-
-The relay delivers that text to Alice like any other message (`from` is `a2a`). Alice replies with her relay token:
-
-```bash
-curl -s -X POST "$BASE/messages" \
-  -H "Authorization: Bearer $ALICE_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"to\":\"a2a\",\"body\":\"Ask them first.\",\"thread_id\":\"THREAD\",\"reply_to\":\"MSG\"}"
-```
-
-`SendMessage` waits up to `A2A_BLOCK_TIMEOUT_MS` (default 20s) for that reply, then returns a task. `configuration.returnImmediately: true` returns `TASK_STATE_WORKING` immediately. `GetTask` (`tasks/get`) polls. `SendStreamingMessage` (`message/stream`) writes SSE events (`data: {"jsonrpc":"2.0",...}`) until the task is terminal or the same timeout. A completed task's artifact is the reply text.
-
-Inbound A2A is delivered as the built-in sender `a2a`. That id is reserved: writing `"a2a"` or `"me"` into `allowlist` returns `400 invalid_request`. A non-null list therefore cannot name the gateway, and `SendMessage` returns JSON-RPC `-32004` (`Recipient allowlist does not include a2a`). Leave `allowlist` omitted or `null` when A2A callers should reach this bot. The same per-bot rate limit, hop limit, and message-id dedupe apply. Only `text` parts are accepted. Treat that text as untrusted: an outside agent is just another sender.
-
-Set `PUBLIC_BASE_URL` to the https origin callers will use. Without it, card URLs use the request host.
-
-### Outbound: message an external A2A agent
-
-Register the agent's Agent Card. The relay fetches the card, picks the first `JSONRPC` interface at protocol `1.0`, and checks that your credential matches a declared scheme. Supported schemes are HTTP Bearer, HTTP Basic, and API keys in a header or query string.
-
-```bash
-curl -s -X POST "$BASE/bots" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "weather",
-    "display_name": "Weather",
-    "a2a_card_url": "https://weather.example/.well-known/agent-card.json",
-    "auth_header_name": "Authorization",
-    "auth_header_value": "Bearer THE_AGENT_TOKEN"
-  }'
-```
-
-`POST /messages` to `weather` calls `SendMessage` on that agent with `A2A-Version: 1.0`. The relay stores the task. When the result has text, `forwardReply` writes a second relay message: `from` is `weather`, `to` is the original sender, `reply_to` is the outbound message, and hop is one higher. That second send skips the rate limit. It still checks the original sender's `allowlist` (the list must be `null` or include `weather`) and `MAX_HOPS`. If that check fails, the outbound message stays `delivered` and its metadata gains `a2a_forward_error`. The original send still has its own allowlist, hop, and rate-limit checks.
-
-Not implemented, on purpose: gRPC and HTTP+JSON bindings, `ListTasks`, push notifications, extended agent cards, Agent Card signatures, OAuth 2.0, OpenID Connect, mTLS, cookie API keys, and non-text parts. A task that is still running when the block timeout ends stays `TASK_STATE_WORKING` and is not polled in the background.
-
-## API
-
-Send `Authorization: Bearer <token>` and `Content-Type: application/json` for requests with a body. Errors look like:
-
-```json
-{ "error": { "code": "rate_limited", "message": "Too many messages. Limit is 60 per 60s.", "retry_after": 42 } }
-```
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/health` | none | `{ "ok": true, "version": "0.1.0", "db": "ok" }` |
-| `POST` | `/bots` | admin token | Register a bot. Returns the relay token once |
-| `GET` | `/bots/me` | relay token | Your registration, without the webhook secret |
-| `PATCH` | `/bots/me` | relay token | Update your registration. `rotate_token: true` returns a new token |
-| `DELETE` | `/bots/me` | relay token | Delete your registration |
-| `GET` | `/bots/:id` | relay token | Public profile: id, display name, `delivery` of `webhook`, `inbox`, or `a2a` |
-| `DELETE` | `/bots/:id` | admin token | Delete any registration |
-| `POST` | `/messages` | relay token | Send a message |
-| `GET` | `/messages/:id` | relay token | Status and delivery log, if you are the sender or recipient |
-| `GET` | `/inbox?limit=50` | relay token | Messages addressed to you that you have not acknowledged |
-| `POST` | `/inbox/ack` | relay token | `{ "ids": ["msg_..."] }` marks them acknowledged |
-| `GET` | `/a2a/bots/:id/.well-known/agent-card.json` | none | A2A Agent Card for that bot |
-| `POST` | `/a2a/bots/:id` | bot `a2a_token` | A2A JSON-RPC (`SendMessage`, `GetTask`, streaming) |
-
-`POST /bots` body:
-
-```json
-{
-  "id": "alice",
-  "display_name": "Alice",
-  "webhook_url": "https://example.com/hook",
-  "auth_header_name": "Authorization",
-  "auth_header_value": "Bearer secret",
-  "allowlist": ["bob"]
-}
-```
-
-`id` is 2–32 characters: lowercase letters, digits, `_`, `-`. It cannot be changed later. `webhook_url` and the auth header are optional. Omit `allowlist` (or send `null`) to accept messages from any registered bot, including inbound A2A. Send `[]` to accept nobody. A non-empty list accepts only those ids. The reserved ids `me` and `a2a` cannot be list entries (`400 invalid_request`), so a non-null list cannot allow inbound A2A. The auth header name and value must be set together. `auth_header_value` is write-only. The name cannot be one of `Host`, `Content-Type`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authorization`, `X-Bot-Relay-Signature`, `X-Bot-Relay-Timestamp`, or `X-Bot-Relay-Id`. Other `X-Bot-Relay-*` names are not rejected; do not invent that prefix.
-
-`POST /messages` body:
-
-```json
-{
-  "to": "bob",
-  "body": "hello",
-  "thread_id": "optional-thread",
-  "reply_to": "msg_optional",
-  "metadata": { "any": "json object" }
-}
-```
-
-Unknown fields are rejected, including `from` and `hop`. A new message returns `202`. A replay of the same `Idempotency-Key` and payload returns `200`. The same key with a different payload returns `409 idempotency_conflict`.
-
-Message status:
-
-| Status | Meaning |
-| --- | --- |
-| `inbox` | The recipient has no webhook. Poll `/inbox` |
-| `pending` | A webhook attempt failed and a retry is scheduled |
-| `delivered` | The webhook returned 2xx |
-| `failed` | Gave up, or the webhook returned a non-retryable 4xx |
-
-`GET /messages/:id` includes a `delivery` array of attempts (`attempt`, `status_code`, `error`, `at`). Response bodies from the webhook are not stored. Every message also stays in the recipient's inbox until `POST /inbox/ack`, including after a successful push, so a bot can use either path. If you use both, dedupe on `id`.
-
-## Envelope and signature
-
-The relay `POST`s this JSON to the recipient webhook. Field order is part of the signed bytes.
-
-```json
-{
-  "v": 1,
-  "id": "msg_01Habc",
-  "from": "alice",
-  "to": "bob",
-  "thread_id": "thr_01Hdef",
-  "reply_to": null,
-  "hop": 1,
-  "max_hops": 8,
-  "timestamp": "2026-11-12T09:24:00.000Z",
-  "body": "hello",
-  "metadata": null
-}
-```
-
-`timestamp` is when the relay accepted the message. `hop` is the hop count in that thread. `max_hops` is the server's current limit so a bot can stop replying before the next send is rejected.
-
-Headers on the webhook request:
-
-| Header | Value |
-| --- | --- |
-| `Content-Type` | `application/json` |
-| `User-Agent` | `bot-relay/0.1.0` (`bot-relay/` plus `src/version.ts`) |
-| `X-Bot-Relay-Signature` | `t=<unix seconds>,v1=<hex hmac-sha256>` |
-| `X-Bot-Relay-Timestamp` | the same unix seconds as `t` |
-| `X-Bot-Relay-Id` | the message id |
-| your auth header | the name and value stored for this recipient |
-
-Registration rejects only those three `X-Bot-Relay-*` names, plus `Host`, `Content-Type`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, and `Proxy-Authorization`. A name such as `X-Bot-Relay-Foo` is accepted and would be forwarded. Do not invent an `X-Bot-Relay-` prefix.
-
-The MAC is HMAC-SHA256 over the ASCII string `t + "." + rawBody`, keyed with `RELAY_SECRET`. `t` is the time of **this delivery attempt**, so a retry gets a fresh timestamp and still verifies. Verify the raw request bytes. Do not parse the JSON and stringify it again.
-
-`SIGNATURE_TOLERANCE_SEC` (default 300) is how far `t` may be from the recipient's clock. Recipients should also ignore a message `id` they have already handled: delivery is at-least-once, and a crash during a delivery can cause one extra attempt.
-
-```js
-import { createHmac, timingSafeEqual } from 'node:crypto';
-
-function verifyBotRelay(rawBody, signatureHeader, secret, toleranceSec = 300) {
-  const parts = Object.fromEntries(
-    signatureHeader.split(',').map((piece) => {
-      const idx = piece.indexOf('=');
-      return [piece.slice(0, idx).trim(), piece.slice(idx + 1).trim()];
-    }),
-  );
-  if (!/^\d{1,12}$/.test(parts.t ?? '') || !/^[0-9a-f]{64}$/i.test(parts.v1 ?? '')) return false;
-  const skew = Math.abs(Math.floor(Date.now() / 1000) - Number(parts.t));
-  if (skew > toleranceSec) return false;
-  const expected = createHmac('sha256', secret).update(`${parts.t}.${rawBody}`).digest('hex');
-  const a = Buffer.from(expected, 'hex');
-  const b = Buffer.from(parts.v1, 'hex');
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-```
-
-```python
-import hashlib, hmac, time
-
-def verify_bot_relay(raw_body: bytes, header: str, secret: str, tolerance: int = 300) -> bool:
-    parts = {}
-    for piece in header.split(","):
-        key, _, value = piece.partition("=")
-        parts[key.strip()] = value.strip()
-    t, v1 = parts.get("t", ""), parts.get("v1", "")
-    if not t.isdigit() or len(v1) != 64:
-        return False
-    if abs(int(time.time()) - int(t)) > tolerance:
-        return False
-    expected = hmac.new(secret.encode(), f"{t}.".encode() + raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, v1.lower())
-```
-
-The recipient needs `RELAY_SECRET` to verify. Treat it as a shared deployment secret, not as something you put in a bot prompt.
-
-## Safety limits
-
-- **Rate limit.** Each sender may send `RATE_LIMIT_MAX` messages per `RATE_LIMIT_WINDOW_SEC` (default 60 per 60 seconds). Over the limit the relay returns `429` with `Retry-After`. Replaying an idempotency key does not consume a slot.
-- **Hop limit.** The first message in a thread is hop 1. The next message that continues that thread, by `thread_id` or `reply_to`, uses `max(hop) + 1`. Past `MAX_HOPS` (default 8) the relay returns `409 hop_limit`. Replying to an older message in the thread does not reset the count. A send that omits both `thread_id` and `reply_to` starts a new thread at hop 1, so this limit stops loops that keep the thread, and the rate limit bounds a bot that opens new threads. Bots that auto-reply should pass the `thread_id` they were given and should stop when `hop` reaches `max_hops`.
-- **Allowlist.** `null` accepts any registered bot, including inbound A2A from the built-in gateway `a2a`. A non-empty list accepts only those ids. `[]` accepts nobody. `a2a` and `me` are reserved and cannot be written into the list (`400 invalid_request`). Leave the list `null` when A2A callers should reach the bot.
-- **Dedupe.** `Idempotency-Key` is remembered per sender for `IDEMPOTENCY_TTL_SEC` (default 24 hours). A message id is claimed before delivery, so a second attempt does not run while the first is in flight or after it has succeeded. Recipients should still dedupe on `id`.
-- **Webhook targets.** URLs must be `https` and must not be loopback, private, link-local, or cloud metadata addresses. Redirects are not followed. At delivery time the relay resolves the name again. If any resolved address is blocked, the attempt fails. It does not pick a public address out of a mixed answer. When every address is allowed, it connects to the first one, with the original hostname kept for `Host` and TLS SNI. `ALLOW_HTTP_WEBHOOKS` and `ALLOW_PRIVATE_WEBHOOKS` exist for local development and should stay off on a shared deployment.
-
-## Security notes
-
-Incoming message bodies are untrusted data from another bot. A signature proves the relay sent that exact body. It does not prove a human approved what the body asks for. Recipients should not let a peer bot trigger sensitive actions without their human's approval. That includes shell commands, purchases, account changes, deleting data, and calling tools that have side effects.
-
-Other notes:
-
-- `ADMIN_TOKEN` can register or delete any bot. Do not put it in a bot, a prompt, or a webhook routine.
-- The relay token is a bearer credential for that bot. `PATCH /bots/me` with `rotate_token: true` replaces it. Only the response that creates or rotates a token includes it.
-- Webhook auth header values and outbound A2A credentials are encrypted with AES-256-GCM. Set `ENCRYPTION_KEY` so that key is separate from the HMAC secret. If it is unset, new ciphertext still uses a key derived from `RELAY_SECRET` (`v1:`), which keeps older deployments working. Ciphertext written after `ENCRYPTION_KEY` is set uses that key (`v2:`). Rows already stored as `v1:` keep decrypting with `RELAY_SECRET`. Rotating `RELAY_SECRET` still changes signatures. Rotating `ENCRYPTION_KEY` means previously stored `v2:` credentials must be saved again.
-- The relay does not log message bodies or webhook header values. `GET /messages/:id` is limited to the sender and the recipient. Another bot's webhook URL and allowlist are not returned.
-- Run one process against a given SQLite file. The delivery guarantee is at-least-once.
-- Put TLS in front of any deployment that is not on localhost. Relay tokens travel in `Authorization`.
-
-## Configuration
-
-Environment variables. See `.env.example`.
-
-| Variable | Default | |
+| 文档 | 给谁看 | 内容 |
 | --- | --- | --- |
-| `PORT` | `8080` | Listen port |
-| `HOST` | `0.0.0.0` | Listen address |
-| `DATABASE_PATH` | `./data/bot-relay.sqlite` | SQLite file. `:memory:` is supported |
-| `ADMIN_TOKEN` | required | Invite token for `POST /bots` and admin delete. At least 8 characters |
-| `RELAY_SECRET` | required | HMAC key and admin session secret. At least 16 characters. Use `openssl rand -hex 32` |
-| `MAX_HOPS` | `8` | Maximum hop count on a thread |
-| `RATE_LIMIT_MAX` | `60` | Messages per sender per window |
-| `RATE_LIMIT_WINDOW_SEC` | `60` | Rate limit window |
-| `DELIVERY_TIMEOUT_MS` | `10000` | Webhook timeout. Timeouts are retried |
-| `DELIVERY_MAX_ATTEMPTS` | `4` | Attempts before `failed` |
-| `DELIVERY_BACKOFF_MS` | `500` | Base backoff. Attempt n waits `base * 2^(n-1)`, capped at 5 minutes |
-| `DELIVERY_POLL_MS` | `500` | How often the process looks for due retries |
-| `BODY_MAX_CHARS` | `16000` | Maximum message body |
-| `METADATA_MAX_CHARS` | `4096` | Maximum JSON metadata |
-| `SIGNATURE_TOLERANCE_SEC` | `300` | Recommended replay window for verifiers |
-| `IDEMPOTENCY_TTL_SEC` | `86400` | How long an idempotency key is remembered |
-| `ALLOW_HTTP_WEBHOOKS` | `false` | Allow `http://` webhook and Agent Card URLs |
-| `ALLOW_PRIVATE_WEBHOOKS` | `false` | Allow loopback and private webhook or Agent Card hosts |
-| `PUBLIC_BASE_URL` | request host | Absolute origin written into Agent Cards |
-| `A2A_BLOCK_TIMEOUT_MS` | `20000` | How long a blocking A2A call waits for a terminal task |
-| `ENCRYPTION_KEY` | unset | Dedicated AES-256-GCM key for stored credentials. Falls back to `RELAY_SECRET` |
-| `TRUST_PROXY` | `false` | Trust `CF-Connecting-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto` |
-| `AUTH_RATE_LIMIT_MAX` | `30` | Per-IP cap for registration and admin login attempts per window |
-| `ADMIN_SESSION_TTL_SEC` | `43200` | Admin browser session lifetime |
+| [`docs/OVERVIEW.md`](docs/OVERVIEW.md) | 人 | 架构与信任边界、安全要点、部署与观测（百行内） |
+| [`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) | Bot / Agent | 注册、目录、询问授权、直连互调与互调鉴权、错误语义、可复制示例 |
+| [`docs/redesign/PRD.md`](docs/redesign/PRD.md) | — | 需求定稿（决策 1–12） |
+| [`docs/redesign/TECH-DESIGN.md`](docs/redesign/TECH-DESIGN.md) | — | 技术设计（数据模型、API、安全机制、阶段计划） |
+| `docs/INTEGRATION.md`、`docs/ARCHITECTURE_AND_USAGE.md` | 归档 | **已过时**，描述旧 0.1.0 中继/A2A 形态，不再适用 |
 
-Retries run on 408, 429, 5xx, timeouts, and connection errors. Other 4xx responses and redirects fail immediately. The first attempt happens inside the `POST /messages` request. Later attempts run in the background.
-
-## Admin, invites, and registration
-
-`ADMIN_TOKEN` still opens every admin API. Invited people can register a bot without it.
-
-Create an invite from the admin UI or `POST /admin/api/invites` with `{ "max_uses": 1, "ttl_sec": 86400 }`. The response includes the code once and a link `/register?code=...`. `GET /admin/api/invites` lists prefixes, uses, and expiry, not the full code. `POST /admin/api/invites/:id/revoke` retires a code. A code stops working when it is revoked, past `expires_at`, or out of uses.
-
-`POST /register` and `POST /bots` accept `invite_code` when the caller does not send the admin token. `GET /register` is a small form that shows the relay token and `a2a_token` once.
-
-`/admin` is a server-rendered page with no external scripts. `GET /admin` only accepts the `br_session` cookie from `POST /admin/login`. Without that cookie the response is JSON `401` with message `Admin login required`, not the login form. The login page is `GET /admin/login`. The session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` when the request is HTTPS. With `TRUST_PROXY=true`, `X-Forwarded-Proto: https` adds `Secure`; an explicit `http` value does not, even if the request URL is https. Mutations from that cookie need the `X-CSRF-Token` from the page. `Authorization: Bearer $ADMIN_TOKEN` works for `/admin/api/*` and does not use the cookie. When `TRUST_PROXY=true`, a non-empty `CF-Access-Authenticated-User-Email` that looks like an email also authorizes `/admin/api/*` only. It does not open `GET /admin` and it is not an admin session. Do not enable `TRUST_PROXY` unless the relay is reachable only through that proxy. Otherwise a client can spoof the header.
-
-The admin list shows id, display name, delivery mode (`webhook`, `inbox`, or `a2a`), disabled state, and message/delivery counts. It does not show webhook URLs, tokens, or decrypted header values. Disable and enable are `POST /admin/api/bots/:id/disable` and `/enable`. A disabled bot cannot send or receive. Delete remains available.
-
-Registration and admin login attempts are rate limited per client address (`AUTH_RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW_SEC`). With `TRUST_PROXY=true` the address is `CF-Connecting-IP`, then the first `X-Forwarded-For` hop.
-
-HTML responses send a strict `Content-Security-Policy` (`default-src 'none'; script-src 'self'; style-src 'self'`). Every response sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: no-referrer`. Admin, register, and message routes send `Cache-Control: no-store`.
-
-## Deploy
-
-Generate both secrets with `openssl rand -hex 32`. Keep a single replica. SQLite on a shared disk with two writers will corrupt or fail.
-
-**VPS.** Install Docker, create `.env`, and run `docker compose up -d --build`. Put Caddy or nginx in front for HTTPS, proxying to `127.0.0.1:8080`. The Compose file stores the database in the `relay-data` volume.
-
-**Fly.io.** One machine, one volume, HTTPS is automatic:
+## 快速开始
 
 ```bash
-fly launch --no-deploy
-fly volumes create relay_data --size 1
-fly secrets set ADMIN_TOKEN="$(openssl rand -hex 32)" RELAY_SECRET="$(openssl rand -hex 32)"
+cp .env.example .env
+# 编辑 .env：ADMIN_TOKEN 与 ENCRYPTION_KEY 用 openssl rand -hex 32 生成，
+# PUBLIC_BASE_URL 填你的对外域名（示例中为 https://relay.songyang.xyz）
+
+docker compose up -d --build   # 宿主仅回环发布 127.0.0.1:8080:8080，公网入口走 Cloudflare Tunnel
+# 或裸机：npm ci && npm run build && node --env-file=.env dist/index.js
 ```
 
-Set `DATABASE_PATH=/data/bot-relay.sqlite`, mount the volume at `/data`, and set `[http_service] internal_port = 8080`. Do not autoscale past one machine.
+公网入口按设计是 Cloudflare Tunnel：本机 cloudflared 把域名回源到 `127.0.0.1:8080`，
+服务只监听回环，不对公网开任何端口（详见 `docs/OVERVIEW.md` 与 `docs/redesign/TECH-DESIGN.md` §12）。
 
-**Railway.** The Dockerfile is the build. Add a volume mounted at `/data`, set `DATABASE_PATH=/data/bot-relay.sqlite`, and set `ADMIN_TOKEN`, `RELAY_SECRET`, and `ENCRYPTION_KEY`. Leave the private-webhook flags unset.
+## 核心概念（30 秒）
 
-**Cloudflare Tunnel and Access.** Run `cloudflared` on the VPS and point a hostname at `http://127.0.0.1:8080`. Set `TRUST_PROXY=true` and `PUBLIC_BASE_URL=https://relay.example.com`. Do not publish port 8080 on the public internet, so clients cannot bypass Cloudflare and spoof `CF-Connecting-IP` or `CF-Access-Authenticated-User-Email`.
+- **注册**：`POST /v1/register`（凭邀请码）→ 一次性下发 `br_` 访问令牌。
+- **目录**：`GET /v1/directory` 只暴露 id / 显示名 / 能力 / 状态 / 更新时间，**永不含联系方式**。
+- **询问授权**：A `POST /v1/inquiries` → bot-relay 把带 Ed25519 签名的询问送达 B 的 webhook →
+  B 亲自 `POST /v1/inquiries/:id/decision` 同意/拒绝（24h 有效，无任何自动同意路径）。
+- **联系方式下发**：同意后 A 经 `GET /v1/grants/:id/contact` 受控刷新获取；撤销后 410。
+- **互调**：A 直连 B 的 webhook，带 `X-Bot-Relay-Identity: <JWT>`（EdDSA，≤300s）；
+  B 用公开 JWKS 离线验签（`/.well-known/bot-relay/jwks.json`），注册中心宕机不阻断既有直连。
+- **凭证只有三种**：部署者 `ADMIN_TOKEN`、Bot 访问令牌、邀请码。
 
-Put Cloudflare Access in front of `/admin`. Access adds `CF-Access-Authenticated-User-Email` after a successful login. When `TRUST_PROXY=true`, the relay accepts that header on `/admin/api/*` only. The HTML console at `GET /admin` still requires a `br_session` cookie from `/admin/login`. You can still require the admin token as a second factor by not relying on the header and signing in on `/admin/login`.
+## 运维界面
 
-In the Cloudflare WAF, add a rate limiting rule for `POST /register`, `POST /bots`, and `POST /admin/login` (for example 10 requests per minute per IP). The relay applies its own per-IP cap as well. Use the "Bot Fight" or a custom rule to challenge anonymous traffic to `/admin` if Access is not covering it.
+- `GET /health`：健康检查；`GET /metrics`：Prometheus 指标（需 `ADMIN_TOKEN`）。
+- `/admin`：管理台（Bot 列表与停用/删除、邀请码、审计视图、凭据查看留痕）。
+- `/register`：注册页（与 JSON API 同构，成功后附下一步可复制示例）。
 
-**Local production build.**
+## 开发
 
 ```bash
-npm ci
-npm run build
-node dist/index.js
-```
-
-## Development
-
-```bash
-npm test
+npm install
 npm run typecheck
+npm run test
 npm run build
 ```
 
-Tests cover registration, auth, signature verification, forwarding to a mock webhook, retries, the hop limit, idempotency and message-id dedupe, rate limiting, allowlists, and A2A inbound and outbound calls against a mock agent.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+技术栈：TypeScript + Hono + `node:sqlite`，单进程 Node ≥22.13，无其他运行时依赖。

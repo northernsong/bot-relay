@@ -45,6 +45,7 @@ function registerIdentityRoutes(app: Hono, deps: Deps): void {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
     limitKey(deps, `identity:${bot.id}`, deps.config.mutationRatePerMin);
     const issued = issueIdentityToken(deps, bot);
+    deps.metrics?.inc('identity_tokens_issued_total');
     return c.json({ token: issued.token, expires_at: iso(issued.expiresAt) });
   });
 
@@ -63,6 +64,7 @@ function registerIdentityRoutes(app: Hono, deps: Deps): void {
       now: deps.now(),
     });
     if (!result.valid) {
+      deps.metrics?.inc('identity_verify_total', { result: 'invalid' });
       throw new HttpError(401, 'invalid_token', `The identity token is invalid (${result.reason})`, undefined, {
         reason: result.reason,
       });
@@ -70,8 +72,10 @@ function registerIdentityRoutes(app: Hono, deps: Deps): void {
     const subject = deps.db.getBot(result.claims.sub);
     if (!subject) {
       // Signed proof of a bot that no longer exists: report it as gone.
+      deps.metrics?.inc('identity_verify_total', { result: 'disabled' });
       return c.json({ valid: false, id: result.claims.sub, display_name: null, disabled: true });
     }
+    deps.metrics?.inc('identity_verify_total', { result: subject.disabled ? 'disabled' : 'valid' });
     return c.json({ valid: !subject.disabled, id: subject.id, display_name: subject.displayName, disabled: subject.disabled });
   });
 
@@ -144,8 +148,19 @@ function registerRegistrationRoutes(app: Hono, deps: Deps): void {
     }
     const bot = deps.db.getBot(id);
     if (!bot) throw new HttpError(500, 'internal', 'Bot disappeared after insert');
-    return c.json({ bot: presentOwnBot(deps, bot), token }, 201);
+    return c.json({ bot: presentOwnBot(deps, bot), token, next_steps: nextSteps(deps, token) }, 201);
   });
+}
+
+/** Copy-paste next steps for the onboarding wizard (P1-2, design §14 stage D). */
+function nextSteps(deps: Deps, token: string): Record<string, string> {
+  const base = deps.config.publicBaseUrl;
+  const auth = `Authorization: Bearer ${token}`;
+  return {
+    check_own_profile: `curl -s ${base}/v1/me -H '${auth}'`,
+    directory_lookup: `curl -s ${base}/v1/directory -H '${auth}'`,
+    open_inquiry: `curl -s -X POST ${base}/v1/inquiries -H '${auth}' -H 'content-type: application/json' -d '{"to":"target-bot-id"}'`,
+  };
 }
 
 function registerMeRoutes(app: Hono, deps: Deps): void {
@@ -208,6 +223,16 @@ function registerMeRoutes(app: Hono, deps: Deps): void {
 
     const now = deps.now();
     deps.db.updateBot(bot.id, patch, now);
+    if (patch.webhookSecretSetAt !== undefined) {
+      deps.db.insertAudit({
+        at: now,
+        actor: bot.id,
+        action: 'webhook.rotated',
+        object: bot.id,
+        detail: JSON.stringify({ reason: 'me.patch' }),
+        source: null,
+      });
+    }
     const updated = deps.db.getBot(bot.id);
     if (!updated) throw new HttpError(500, 'internal', 'Bot disappeared after update');
     return c.json({ bot: presentOwnBot(deps, updated) });
@@ -218,12 +243,29 @@ function registerMeRoutes(app: Hono, deps: Deps): void {
     const token = newToken();
     const now = deps.now();
     deps.db.updateBot(bot.id, { tokenHash: hashToken(token), tokenSetAt: now }, now);
+    deps.db.insertAudit({
+      at: now,
+      actor: bot.id,
+      action: 'token.rotated',
+      object: bot.id,
+      detail: null,
+      source: null,
+    });
     return c.json({ token });
   });
 
   app.post('/v1/me/token/revoke', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
-    deps.db.updateBot(bot.id, { tokenRevokedAt: deps.now() }, deps.now());
+    const now = deps.now();
+    deps.db.updateBot(bot.id, { tokenRevokedAt: now }, now);
+    deps.db.insertAudit({
+      at: now,
+      actor: bot.id,
+      action: 'token.revoked',
+      object: bot.id,
+      detail: null,
+      source: null,
+    });
     return c.json({ revoked: true });
   });
 }
@@ -232,12 +274,14 @@ function registerDirectoryRoutes(app: Hono, deps: Deps): void {
   app.get('/v1/directory', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
     limitKey(deps, `directory:${bot.id}`, deps.config.defaultRatePerMin);
+    deps.metrics?.inc('directory_lookups_total');
     return c.json({ bots: deps.db.listBots().map(presentDirectoryBot) });
   });
 
   app.get('/v1/directory/:id', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
     limitKey(deps, `directory:${bot.id}`, deps.config.defaultRatePerMin);
+    deps.metrics?.inc('directory_lookups_total');
     const target = deps.db.getBot(c.req.param('id') ?? '');
     if (!target) throw new HttpError(404, 'not_found', 'No such bot');
     return c.json({ bot: presentDirectoryBot(target) });

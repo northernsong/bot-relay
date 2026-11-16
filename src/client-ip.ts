@@ -76,6 +76,7 @@ export async function limitAuth(deps: Deps, c: Context, purpose: 'register' | 'l
   const max = purpose === 'register' ? deps.config.registerRatePerMin : deps.config.loginRatePerMin;
   const rate = deps.db.consumeRate(`${purpose}:${ip}`, deps.now(), deps.config.rateLimitWindowSec * 1000, max);
   if (!rate.allowed) {
+    deps.metrics?.inc('rate_limited_total', { scope: purpose });
     throw new HttpError(
       429,
       'rate_limited',
@@ -94,17 +95,19 @@ function firstIp(value: string | undefined): string | null {
 
 /**
  * Rate limit on an arbitrary key (bot id, pair, ...) using the shared
- * `rate_hits` window counter (design §9.2).
+ * `rate_hits` window counter (design §9.2). The metric scope defaults to the
+ * purpose prefix of the key (`directory`, `identity`, `pair`, ...).
  */
 export function limitKey(
   deps: Deps,
   key: string,
   max: number,
-  opts: { code?: string; windowMs?: number } = {},
+  opts: { code?: string; windowMs?: number; scope?: string } = {},
 ): void {
   const windowMs = opts.windowMs ?? deps.config.rateLimitWindowSec * 1000;
   const rate = deps.db.consumeRate(key, deps.now(), windowMs, max);
   if (!rate.allowed) {
+    deps.metrics?.inc('rate_limited_total', { scope: opts.scope ?? (key.split(':')[0] ?? 'default') });
     throw new HttpError(
       429,
       opts.code ?? 'rate_limited',

@@ -279,12 +279,16 @@ export class RelayDb {
       .run(event.at, event.actor, event.action, event.object ?? null, event.detail ?? null, event.source ?? null);
   }
 
-  /** Most recent events first (the admin audit view lands in phase D). */
-  listAuditEvents(limit = 100): AuditEvent[] {
+  /** Most recent events first (design §10.3); `before` pages by falling id. */
+  listAuditEvents(limit = 100, before?: number): AuditEvent[] {
     const clamped = Math.min(Math.max(1, Math.floor(limit)), 500);
-    const rows = this.sqlite
-      .prepare(`SELECT * FROM audit_events ORDER BY id DESC LIMIT ?`)
-      .all(clamped) as unknown as RawAuditEvent[];
+    const rows = (
+      before === undefined
+        ? this.sqlite.prepare(`SELECT * FROM audit_events ORDER BY id DESC LIMIT ?`).all(clamped)
+        : this.sqlite
+            .prepare(`SELECT * FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT ?`)
+            .all(before, clamped)
+    ) as unknown as RawAuditEvent[];
     return rows.map(mapAuditEvent);
   }
 
@@ -474,23 +478,37 @@ export class RelayDb {
     return Number(result.changes) === 1;
   }
 
-  /** Sweep: pending past expires_at becomes expired (lazy + timer both call this). */
-  expirePendingInquiries(now: number): number {
-    const result = this.sqlite
+  /**
+   * Sweep: pending past expires_at becomes expired (lazy + timer both call
+   * this). Returns the ids it expired so callers can audit each row.
+   */
+  expirePendingInquiries(now: number): string[] {
+    const rows = this.sqlite
+      .prepare(`SELECT id FROM inquiries WHERE status = 'pending' AND expires_at < ?`)
+      .all(now) as unknown as Array<{ id: string }>;
+    if (rows.length === 0) return [];
+    this.sqlite
       .prepare(`UPDATE inquiries SET status = 'expired' WHERE status = 'pending' AND expires_at < ?`)
       .run(now);
-    return Number(result.changes);
+    return rows.map((row) => row.id);
   }
 
-  /** Sweep: delivering rows stuck longer than stuckMs (crash residue) become undelivered. */
-  failStuckDeliveries(now: number, stuckMs: number, error: string): number {
-    const result = this.sqlite
+  /**
+   * Sweep: delivering rows stuck longer than stuckMs (crash residue) become
+   * undelivered. Returns the ids it buried so callers can audit each row.
+   */
+  failStuckDeliveries(now: number, stuckMs: number, error: string): string[] {
+    const rows = this.sqlite
+      .prepare(`SELECT id FROM inquiries WHERE status = 'delivering' AND created_at <= ?`)
+      .all(now - stuckMs) as unknown as Array<{ id: string }>;
+    if (rows.length === 0) return [];
+    this.sqlite
       .prepare(
         `UPDATE inquiries SET status = 'undelivered', delivery_error = ?
          WHERE status = 'delivering' AND created_at <= ?`,
       )
       .run(error, now - stuckMs);
-    return Number(result.changes);
+    return rows.map((row) => row.id);
   }
 
   insertGrant(grant: Grant): void {

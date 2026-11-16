@@ -23,19 +23,23 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
 
   app.get('/register', (c) => {
     const code = c.req.query('code') ?? '';
-    return c.html(registerPage(code.slice(0, 120)));
+    return c.html(registerPage(code.slice(0, 120), deps.config.publicBaseUrl));
   });
 
   app.get('/admin/login', (c) => c.html(loginPage()));
 
   app.post('/admin/login', async (c) => {
     await limitAuth(deps, c, 'login');
+    const source = clientIp(c, deps.config.trustedProxies);
     const body = await readLogin(c);
     if (typeof body.token !== 'string' || !timingEqual(body.token, deps.config.adminToken)) {
+      deps.metrics?.inc('admin_login_failures_total');
+      deps.db.insertAudit({ at: deps.now(), actor: 'admin', action: 'admin.login.fail', object: null, detail: null, source });
       throw new HttpError(401, 'unauthorized', 'Admin token required');
     }
     const session = createSession(deps.now(), deps.config.adminSessionTtlSec);
     setSessionCookie(c, deps, signSession(session, deps.db.getServerSecret()));
+    deps.db.insertAudit({ at: deps.now(), actor: 'admin', action: 'admin.login.ok', object: null, detail: null, source });
     if (wantsJson(c)) return c.json({ ok: true, csrf: session.csrf });
     return c.redirect('/admin', 303);
   });
@@ -169,6 +173,16 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
       expiresAt,
       createdAt: deps.now(),
     });
+    // Audit metadata only — the invite code itself is a secret and never lands
+    // in the trail (§10.3).
+    deps.db.insertAudit({
+      at: deps.now(),
+      actor: 'admin',
+      action: 'invite.created',
+      object: String(id),
+      detail: JSON.stringify({ prefix: code.slice(0, 12), max_uses: maxUses, label }),
+      source: clientIp(c, deps.config.trustedProxies),
+    });
     return c.json({
       invite: {
         id,
@@ -186,8 +200,65 @@ export function registerAdminRoutes(app: Hono, deps: Deps): void {
     const id = Number(c.req.param('id'));
     if (!Number.isInteger(id) || id < 1) throw new HttpError(400, 'invalid_request', 'Invite id is invalid');
     if (!deps.db.revokeInvite(id, deps.now())) throw new HttpError(404, 'not_found', 'Invite not found');
+    deps.db.insertAudit({
+      at: deps.now(),
+      actor: 'admin',
+      action: 'invite.revoked',
+      object: String(id),
+      detail: null,
+      source: clientIp(c, deps.config.trustedProxies),
+    });
     return c.json({ revoked: true, id });
   });
+
+  // Audit view (P1-1, design §10.3): most recent events first, paginated by
+  // falling id. `next_before` is the cursor for the next page, null at the end.
+  app.get('/admin/api/audit', async (c) => {
+    await requireAdminAccess(c, deps, false);
+    let limit = 100;
+    const limitRaw = c.req.query('limit');
+    if (limitRaw !== undefined && limitRaw !== '') {
+      const parsed = Number(limitRaw);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 500) {
+        throw new HttpError(400, 'invalid_request', 'limit must be an integer from 1 to 500');
+      }
+      limit = parsed;
+    }
+    let before: number | undefined;
+    const beforeRaw = c.req.query('before');
+    if (beforeRaw !== undefined && beforeRaw !== '') {
+      const parsed = Number(beforeRaw);
+      if (!Number.isInteger(parsed) || parsed < 1) {
+        throw new HttpError(400, 'invalid_request', 'before must be a positive event id');
+      }
+      before = parsed;
+    }
+    const events = deps.db.listAuditEvents(limit, before);
+    const oldest = events.length > 0 ? events[events.length - 1]?.id : null;
+    return c.json({
+      events: events.map((event) => ({
+        id: event.id,
+        at: new Date(event.at).toISOString(),
+        actor: event.actor,
+        action: event.action,
+        object: event.object,
+        detail: parseDetail(event.detail),
+        source: event.source,
+      })),
+      next_before: events.length === limit ? oldest : null,
+    });
+  });
+}
+
+/** Audit detail is stored as JSON text; surface it as an object when possible. */
+function parseDetail(detail: string | null): Record<string, unknown> | string | null {
+  if (detail === null) return null;
+  try {
+    const parsed = JSON.parse(detail) as unknown;
+    return parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : detail;
+  } catch {
+    return detail;
+  }
 }
 
 /** The regular list never includes webhook URLs or secrets (P0-6). */

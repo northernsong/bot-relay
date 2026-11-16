@@ -48,7 +48,7 @@ export function dashboardPage(csrf: string): string {
       <section>
         <h2>Bots</h2>
         <p class="note">Webhook URLs and stored credentials are not shown.</p>
-        <table id="bots"><thead><tr><th>Id</th><th>Name</th><th>Status</th><th>Last activity</th><th>Token set</th><th></th></tr></thead><tbody></tbody></table>
+        <table id="bots"><thead><tr><th>Id</th><th>Name</th><th>Status</th><th>Last activity</th><th>Token set</th><th>Webhook secret set</th><th></th></tr></thead><tbody></tbody></table>
       </section>
       <section>
         <h2>Invite codes</h2>
@@ -61,12 +61,19 @@ export function dashboardPage(csrf: string): string {
         <p id="new-invite" class="note"></p>
         <table id="invites"><thead><tr><th>Prefix</th><th>Uses</th><th>Expires</th><th>Status</th><th></th></tr></thead><tbody></tbody></table>
       </section>
+      <section>
+        <h2>Audit trail</h2>
+        <p class="note">Most recent events first. Page through with the button below.</p>
+        <table id="audit"><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Object</th><th>Detail</th><th>Source</th></tr></thead><tbody></tbody></table>
+        <p><button class="ghost" id="audit-more" type="button">Load more</button></p>
+      </section>
     </main>
     <script src="/admin/app.js"></script>
   `, csrf);
 }
 
-export function registerPage(code: string): string {
+export function registerPage(code: string, baseUrl: string): string {
+  const base = escapeHtml(baseUrl);
   return layout('Register a bot', `
     <h1>Register a bot</h1>
     <p class="note">You need an invite code. The bot access token is shown once.</p>
@@ -80,7 +87,17 @@ export function registerPage(code: string): string {
       <label>Webhook auth header value <input name="webhook_auth_value" placeholder="Bearer ..."></label>
       <button type="submit">Register</button>
     </form>
-    <pre id="result" class="note"></pre>
+    <details>
+      <summary>What comes next</summary>
+      <p class="note">After registering you get copy-ready examples: a directory lookup and an inquiry. The same commands are printed with your token on success:</p>
+      <pre>curl -s ${base}/v1/directory -H 'Authorization: Bearer &lt;token&gt;'
+curl -s -X POST ${base}/v1/inquiries \\
+  -H 'Authorization: Bearer &lt;token&gt;' \\
+  -H 'content-type: application/json' \\
+  -d '{"to":"target-bot-id"}'</pre>
+      <p class="note">Full walkthrough: docs/AGENT_GUIDE.md.</p>
+    </details>
+    <div id="result"></div>
     <script src="/register/app.js"></script>
   `);
 }
@@ -101,7 +118,7 @@ async function loadBots() {
   const data = await api('/admin/api/bots');
   for (const bot of data.bots) {
     const tr = document.createElement('tr');
-    tr.append(cell(bot.id), cell(bot.display_name), cell(bot.disabled ? 'disabled' : 'active'), cell(bot.last_seen_at || 'never'), cell(bot.token_set_at));
+    tr.append(cell(bot.id), cell(bot.display_name), cell(bot.disabled ? 'disabled' : 'active'), cell(bot.last_seen_at || 'never'), cell(bot.token_set_at), cell(bot.webhook_secret_set_at || 'never'));
     const actions = document.createElement('td');
     const toggle = document.createElement('button');
     toggle.textContent = bot.disabled ? 'Enable' : 'Disable';
@@ -155,8 +172,24 @@ document.querySelector('#invite-form').onsubmit = async (event) => {
   box.append('New invite: ', code, link, ' ', copy);
   await loadInvites();
 };
+let auditCursor;
+async function loadAudit(reset) {
+  const body = document.querySelector('#audit tbody');
+  if (reset) { body.replaceChildren(); auditCursor = undefined; }
+  const query = auditCursor === undefined ? '' : '?before=' + auditCursor;
+  const data = await api('/admin/api/audit' + query);
+  for (const event of data.events) {
+    const tr = document.createElement('tr');
+    tr.append(cell(event.at), cell(event.actor), cell(event.action), cell(event.object), cell(event.detail === null ? '' : JSON.stringify(event.detail)), cell(event.source));
+    body.append(tr);
+  }
+  auditCursor = data.next_before === null ? undefined : data.next_before;
+  document.querySelector('#audit-more').disabled = data.next_before === null;
+}
+document.querySelector('#audit-more').onclick = async () => { await loadAudit(false); };
 loadBots().catch((err) => alert(err.message));
 loadInvites().catch((err) => alert(err.message));
+loadAudit(true).catch((err) => alert(err.message));
 `;
 
 export const registerJs = `
@@ -168,8 +201,34 @@ document.querySelector('#register-form').onsubmit = async (event) => {
   const res = await fetch('/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(payload) });
   const data = await res.json().catch(() => ({}));
   const box = document.querySelector('#result');
-  if (!res.ok) { box.textContent = (data.error && data.error.message) || 'Registration failed'; return; }
-  box.textContent = 'Copy this now. It will not be shown again.\\nbot access token: ' + data.token;
+  box.replaceChildren();
+  if (!res.ok) {
+    const note = document.createElement('p');
+    note.className = 'note';
+    note.textContent = (data.error && data.error.message) || 'Registration failed';
+    box.append(note);
+    return;
+  }
+  const warn = document.createElement('p');
+  warn.textContent = 'Copy this now. It will not be shown again.';
+  const tokenLine = document.createElement('p');
+  const tokenCode = document.createElement('code');
+  tokenCode.textContent = data.token;
+  tokenLine.append('Bot access token: ', tokenCode);
+  box.append(warn, tokenLine);
+  for (const step of Object.values(data.next_steps || {})) {
+    const line = document.createElement('p');
+    const code = document.createElement('code');
+    code.style.display = 'block';
+    code.style.wordBreak = 'break-all';
+    code.textContent = step;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'Copy';
+    copy.onclick = () => navigator.clipboard.writeText(step);
+    line.append(code, copy);
+    box.append(line);
+  }
 };
 `;
 

@@ -1,19 +1,20 @@
 services:
   bot-relay:
     build: .
-    ports:
-      - "8080:8080"
+    # Everything comes from .env (design §12.1, fixes E3): new config keys
+    # take effect without touching this file.
+    env_file: .env
+    # Inside its own network namespace the container must bind all interfaces
+    # for the port mapping below to work; the host side stays loopback-only,
+    # so the service is still unreachable from the public network.
     environment:
-      PORT: "8080"
-      HOST: "0.0.0.0"
+      HOST: 0.0.0.0
       DATABASE_PATH: /data/bot-relay.sqlite
-      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
-      RELAY_SECRET: ${RELAY_SECRET:?set RELAY_SECRET in .env}
-      MAX_HOPS: ${MAX_HOPS:-8}
-      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-60}
-      RATE_LIMIT_WINDOW_SEC: ${RATE_LIMIT_WINDOW_SEC:-60}
-      ALLOW_HTTP_WEBHOOKS: ${ALLOW_HTTP_WEBHOOKS:-false}
-      ALLOW_PRIVATE_WEBHOOKS: ${ALLOW_PRIVATE_WEBHOOKS:-false}
+    # Loopback-only publishing: the local cloudflared tunnels
+    # https://relay.songyang.xyz back to 127.0.0.1:8080 on this host. Never
+    # bind 0.0.0.0 here (decision D1).
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - relay-data:/data
     restart: unless-stopped

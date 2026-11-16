@@ -3,6 +3,7 @@ import { HttpError } from './errors.js';
 import { newInquiryId } from './ids.js';
 import { signInquiryPayload } from './identity.js';
 import { buildContact, upsertGrantOnApproval, type ContactPayload } from './grants.js';
+import { deliveryFailureReason } from './metrics.js';
 import { decryptSecret } from './secret.js';
 import { redactLogLine } from './redact.js';
 import { BlockedAddressError, pinnedFetch, readCappedBody } from './ssrf.js';
@@ -47,6 +48,7 @@ export function openInquiry(deps: Deps, requester: Bot, to: unknown): OpenResult
     if (target.disabled) throw new HttpError(410, 'grant_inactive', 'The target bot is disabled');
     const now = deps.now();
     deps.db.updateGrant(grant.id, { refreshedAt: now, refreshedContactVersion: target.contactVersion });
+    deps.metrics?.inc('grants_refresh_total');
     return { kind: 'contact', grantId: grant.id, contact: buildContact(deps, target, now) };
   }
 
@@ -65,6 +67,7 @@ export function openInquiry(deps: Deps, requester: Bot, to: unknown): OpenResult
 
   const rate = deps.db.consumeRate(`pair:${requester.id}>${targetId}`, deps.now(), OUTBOUND_WINDOW_MS, deps.config.inquiryPairRatePerHour);
   if (!rate.allowed) {
+    deps.metrics?.inc('rate_limited_total', { scope: 'pair' });
     throw new HttpError(
       429,
       'inquiry_rate_limited',
@@ -96,6 +99,15 @@ export function openInquiry(deps: Deps, requester: Bot, to: unknown): OpenResult
     }
     throw err;
   }
+  deps.metrics?.inc('inquiries_created_total');
+  deps.db.insertAudit({
+    at: now,
+    actor: requester.id,
+    action: 'inquiry.created',
+    object: inquiry.id,
+    detail: JSON.stringify({ to: targetId }),
+    source: null,
+  });
   scheduleDelivery(deps, inquiry.id);
   return { kind: 'created', inquiry };
 }
@@ -126,6 +138,15 @@ export function decideInquiry(deps: Deps, actor: Bot, inquiryId: string, decisio
     const raced = deps.db.getInquiry(inquiryId);
     throw new HttpError(409, 'inquiry_closed', `This inquiry is ${raced?.status ?? next} and no longer awaits a decision`);
   }
+  deps.metrics?.inc('inquiry_outcome_total', { outcome: next });
+  deps.db.insertAudit({
+    at: now,
+    actor: actor.id,
+    action: 'inquiry.decided',
+    object: inquiryId,
+    detail: JSON.stringify({ decision }),
+    source: null,
+  });
   const updated = deps.db.getInquiry(inquiryId);
   if (!updated) throw new HttpError(500, 'internal', 'Inquiry disappeared after decision');
   return updated;
@@ -149,8 +170,28 @@ export function getInquiryFor(deps: Deps, bot: Bot, id: string): Inquiry {
 export function sweepInquiries(deps: Deps): void {
   if (deps.db.closed) return;
   const now = deps.now();
-  deps.db.expirePendingInquiries(now);
-  deps.db.failStuckDeliveries(now, STUCK_DELIVERING_MS, 'timeout');
+  const expired = deps.db.expirePendingInquiries(now);
+  if (expired.length > 0) {
+    deps.metrics?.inc('inquiry_outcome_total', { outcome: 'expired' }, expired.length);
+    for (const id of expired) {
+      deps.db.insertAudit({ at: now, actor: 'registry', action: 'inquiry.expired', object: id, detail: null, source: null });
+    }
+  }
+  const stuck = deps.db.failStuckDeliveries(now, STUCK_DELIVERING_MS, 'timeout');
+  if (stuck.length > 0) {
+    deps.metrics?.inc('inquiry_outcome_total', { outcome: 'undelivered' }, stuck.length);
+    deps.metrics?.inc('inquiry_delivery_failures_total', { reason: 'timeout' }, stuck.length);
+    for (const id of stuck) {
+      deps.db.insertAudit({
+        at: now,
+        actor: 'registry',
+        action: 'inquiry.undelivered',
+        object: id,
+        detail: JSON.stringify({ reason: 'timeout' }),
+        source: null,
+      });
+    }
+  }
 }
 
 /** Periodic sweeper (60s) plus one run at startup (design §6.5). */
@@ -185,12 +226,12 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
     if (!inquiry || inquiry.status !== 'delivering') return;
     const target = deps.db.getBot(inquiry.targetId);
     if (!target) {
-      deps.db.transitionInquiry(inquiryId, 'delivering', { status: 'undelivered', deliveryError: 'connection_failed' });
+      markUndelivered(deps, inquiryId, 'connection_failed');
       return;
     }
     const rate = deps.db.consumeRate(`outbound:${target.id}`, deps.now(), OUTBOUND_WINDOW_MS, OUTBOUND_DELIVERIES_PER_HOUR);
     if (!rate.allowed) {
-      deps.db.transitionInquiry(inquiryId, 'delivering', { status: 'undelivered', deliveryError: 'rate_limited' });
+      markUndelivered(deps, inquiryId, 'rate_limited');
       return;
     }
     const url = decryptSecret(target.webhookUrlEnc, deps.config.encryptionKey);
@@ -227,18 +268,28 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
         },
       );
     } catch (err) {
-      deps.db.transitionInquiry(inquiryId, 'delivering', { status: 'undelivered', deliveryError: classifyDeliveryError(err) });
+      markUndelivered(deps, inquiryId, classifyDeliveryError(err));
       return;
     }
     await readCappedBody(response, RESPONSE_BODY_LIMIT);
     if (response.status >= 200 && response.status < 300) {
-      deps.db.transitionInquiry(inquiryId, 'delivering', {
+      if (deps.db.transitionInquiry(inquiryId, 'delivering', {
         status: 'pending',
         deliveredAt: deps.now(),
         deliveryError: null,
-      });
+      })) {
+        deps.metrics?.inc('inquiry_outcome_total', { outcome: 'pending' });
+        deps.db.insertAudit({
+          at: deps.now(),
+          actor: 'registry',
+          action: 'inquiry.delivered',
+          object: inquiryId,
+          detail: null,
+          source: null,
+        });
+      }
     } else {
-      deps.db.transitionInquiry(inquiryId, 'delivering', { status: 'undelivered', deliveryError: 'http_5xx' });
+      markUndelivered(deps, inquiryId, 'http_5xx');
     }
   } catch (err) {
     // Never let a background delivery crash the process; state stays delivering
@@ -252,6 +303,21 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
       }),
     );
   }
+}
+
+/** Shared terminal transition for a failed delivery: state, metric, audit. */
+function markUndelivered(deps: Deps, inquiryId: string, reason: string): void {
+  if (!deps.db.transitionInquiry(inquiryId, 'delivering', { status: 'undelivered', deliveryError: reason })) return;
+  deps.metrics?.inc('inquiry_outcome_total', { outcome: 'undelivered' });
+  deps.metrics?.inc('inquiry_delivery_failures_total', { reason: deliveryFailureReason(reason) });
+  deps.db.insertAudit({
+    at: deps.now(),
+    actor: 'registry',
+    action: 'inquiry.undelivered',
+    object: inquiryId,
+    detail: JSON.stringify({ reason }),
+    source: null,
+  });
 }
 
 function classifyDeliveryError(err: unknown): string {

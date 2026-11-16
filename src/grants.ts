@@ -60,6 +60,7 @@ export function refreshGrantContact(deps: Deps, requester: Bot, grantId: string)
   if (target.disabled) throw new HttpError(410, 'grant_inactive', 'The target bot is disabled');
   const now = deps.now();
   deps.db.updateGrant(grant.id, { refreshedAt: now, refreshedContactVersion: target.contactVersion });
+  deps.metrics?.inc('grants_refresh_total');
   return { grant_id: grant.id, contact: buildContact(deps, target, now) };
 }
 
@@ -81,7 +82,16 @@ export function abandonGrant(deps: Deps, requester: Bot, grantId: string): void 
   if (grant.revokedAt !== null || grant.abandonedAt !== null) {
     throw new HttpError(409, 'grant_inactive', 'This grant is no longer active');
   }
-  deps.db.updateGrant(grant.id, { abandonedAt: deps.now() });
+  const now = deps.now();
+  deps.db.updateGrant(grant.id, { abandonedAt: now });
+  deps.db.insertAudit({
+    at: now,
+    actor: requester.id,
+    action: 'grant.abandoned',
+    object: grant.id,
+    detail: JSON.stringify({ peer: grant.targetId }),
+    source: null,
+  });
 }
 
 export function revokeGrant(
@@ -112,6 +122,24 @@ export function revokeGrant(
       rotated = true;
     }
   });
+  deps.db.insertAudit({
+    at: now,
+    actor: target.id,
+    action: 'grant.revoked',
+    object: grant.id,
+    detail: JSON.stringify({ requester: grant.requesterId, rotated_webhook_secret: rotated }),
+    source: null,
+  });
+  if (rotated) {
+    deps.db.insertAudit({
+      at: now,
+      actor: target.id,
+      action: 'webhook.rotated',
+      object: target.id,
+      detail: JSON.stringify({ reason: 'grant.revoked' }),
+      source: null,
+    });
+  }
   return { revoked: true, webhook_secret_rotated: rotated };
 }
 

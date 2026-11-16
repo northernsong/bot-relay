@@ -2,14 +2,20 @@ import { Hono } from 'hono';
 
 import { registerV1Routes } from './api.js';
 import { registerAdminRoutes } from './admin/routes.js';
+import { isAdminBearer } from './auth.js';
 import type { Deps } from './deps.js';
 import { HttpError } from './errors.js';
 import { buildJwks, ensureSigningKey } from './identity.js';
+import { Metrics, normalizeRoute, renderMetrics } from './metrics.js';
 import { redactLogLine } from './redact.js';
+import { ADMIN_COOKIE, readCookie, readSession } from './session.js';
 import { VERSION } from './version.js';
 
 export function createApp(deps: Deps): Hono {
   const app = new Hono();
+  // Attached before any route registration so handlers and background tasks
+  // can increment counters from the first request on.
+  deps.metrics ??= new Metrics();
 
   // First start generates the Ed25519 signing key pair (§7.1): the private
   // half is encrypted at rest right away, the public half only ever leaves
@@ -62,6 +68,31 @@ export function createApp(deps: Deps): Hono {
   app.get('/.well-known/bot-relay/jwks.json', (c) => {
     c.header('Cache-Control', 'public, max-age=300');
     return c.json(buildJwks(deps));
+  });
+
+  // Business-plane latency histogram (design §11). Route ids collapse to
+  // :id so the label stays small; wall-clock timing, not deps.now.
+  app.use('/v1/*', async (c, next) => {
+    const startedAt = performance.now();
+    await next();
+    deps.metrics?.observe(
+      'http_request_duration_seconds',
+      { route: normalizeRoute(c.req.method, c.req.path), status: String(c.res.status) },
+      (performance.now() - startedAt) / 1000,
+    );
+  });
+
+  // Prometheus text exposition, deployer-only (design §5.7, §11): admin
+  // bearer token or a logged-in admin session; nothing else may scrape it.
+  app.get('/metrics', (c) => {
+    if (!isAdminBearer(deps, c.req.header('authorization'))) {
+      const raw = readCookie(c.req.header('cookie'), ADMIN_COOKIE);
+      if (!readSession(raw ?? undefined, deps.db.getServerSecret(), deps.now())) {
+        throw new HttpError(401, 'unauthorized', 'Admin token required', { 'www-authenticate': 'Bearer' });
+      }
+    }
+    c.header('Cache-Control', 'no-store');
+    return c.body(renderMetrics(deps), 200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' });
   });
 
   registerV1Routes(app, deps);
