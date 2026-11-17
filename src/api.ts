@@ -41,10 +41,33 @@ export function registerV1Routes(app: Hono, deps: Deps): void {
 /** Inter-bot authentication surface (design §5.6, §7). */
 function registerIdentityRoutes(app: Hono, deps: Deps): void {
   // Disabled bots get no new proofs (§7.4): stop issuing at the door.
-  app.post('/v1/identity-token', (c) => {
+  //
+  // Audience binding (anti-impersonation): every proof names the one bot it is
+  // for (`aud`, required). The target must exist, be enabled, and share an
+  // active grant with the caller in either direction (caller -> aud: aud
+  // approved the caller; aud -> caller: the caller approved aud and may answer
+  // it). Receivers require aud === their own id, so B cannot replay a proof
+  // that A minted for B against C.
+  app.post('/v1/identity-token', async (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
     limitKey(deps, `identity:${bot.id}`, deps.config.mutationRatePerMin);
-    const issued = issueIdentityToken(deps, bot);
+    const body = await readOptionalJsonObject(c);
+    rejectUnknown(body, ['aud']);
+    if (body.aud === undefined || body.aud === null || body.aud === '') {
+      throw new HttpError(400, 'aud_required', 'Name the bot you are about to call: {"aud":"<target bot id>"}');
+    }
+    const aud = parseBotId(body.aud, 'aud');
+    if (aud === bot.id) throw new HttpError(400, 'invalid_request', 'aud must be another bot, not yourself');
+    const target = deps.db.getBot(aud);
+    if (!target || target.disabled) throw new HttpError(404, 'target_not_found', `No active bot "${aud}"`);
+    if (!hasActiveGrantBetween(deps, bot.id, aud)) {
+      throw new HttpError(
+        403,
+        'no_grant',
+        `No active grant between you and "${aud}" in either direction; open an inquiry and get it approved first`,
+      );
+    }
+    const issued = issueIdentityToken(deps, bot, aud);
     deps.metrics?.inc('identity_tokens_issued_total');
     return c.json({ token: issued.token, expires_at: iso(issued.expiresAt) });
   });
@@ -54,14 +77,18 @@ function registerIdentityRoutes(app: Hono, deps: Deps): void {
     const caller = requireActiveBot(deps, c.req.header('authorization'));
     limitKey(deps, `verify:${caller.id}`, deps.config.defaultRatePerMin);
     const body = await readJsonObject(c);
-    rejectUnknown(body, ['token']);
+    rejectUnknown(body, ['token', 'audience']);
     if (typeof body.token !== 'string' || body.token.trim() === '') {
       throw new HttpError(401, 'invalid_token', 'Provide the JWT string in the "token" field');
     }
+    // Expected audience defaults to the verifying bot itself: the usual caller
+    // is the receiver checking a proof that should have been minted for it.
+    const audience = body.audience === undefined ? caller.id : parseBotId(body.audience, 'audience');
     const result = verifyIdentityToken(body.token, {
       jwks: buildJwks(deps),
       iss: deps.config.publicBaseUrl,
       now: deps.now(),
+      aud: audience,
     });
     if (!result.valid) {
       deps.metrics?.inc('identity_verify_total', { result: 'invalid' });
@@ -160,9 +187,16 @@ function nextSteps(deps: Deps, token: string): Record<string, string> {
     check_own_profile: `curl -s ${base}/v1/me -H '${auth}'`,
     directory_lookup: `curl -s ${base}/v1/directory -H '${auth}'`,
     open_inquiry: `curl -s -X POST ${base}/v1/inquiries -H '${auth}' -H 'content-type: application/json' -d '{"to":"target-bot-id"}'`,
-    get_identity_token: `curl -s -X POST ${base}/v1/identity-token -H '${auth}'`,
+    get_identity_token: `curl -s -X POST ${base}/v1/identity-token -H '${auth}' -H 'content-type: application/json' -d '{"aud":"<peer bot id>"}'`,
     call_peer_directly: `curl -s -X POST '<peer webhook_url>' -H '<peer webhook_auth_name>: <peer webhook_auth_value>' -H '${IDENTITY_HEADER}: <fresh token from get_identity_token>' -H 'content-type: application/json' -d '{...}'`,
   };
+}
+
+/** True when caller and peer share a non-revoked, non-abandoned grant, either direction. */
+function hasActiveGrantBetween(deps: Deps, a: string, b: string): boolean {
+  return [deps.db.findGrantByPair(a, b), deps.db.findGrantByPair(b, a)].some(
+    (grant) => grant !== undefined && grant.revokedAt === null && grant.abandonedAt === null,
+  );
 }
 
 /**
@@ -178,9 +212,9 @@ function directCallGuide(deps: Deps): Record<string, string | boolean> {
   return {
     required: true,
     header: IDENTITY_HEADER,
-    get_token: `POST ${base}/v1/identity-token (Authorization: Bearer <your br_ token>) -> {"token":"eyJ...","expires_at":"..."}`,
-    rule: `Every direct call to a peer webhook must carry ${IDENTITY_HEADER}: <token> next to the peer's own webhook auth header. Fetch a fresh token per call (valid <= 300s).`,
-    receiver_check: `Verify ${IDENTITY_HEADER} against ${base}/.well-known/bot-relay/jwks.json (EdDSA, iss=${base}, exp); reject the call if it is missing or invalid. Inquiries from the registry carry X-Bot-Relay-Signature instead.`,
+    get_token: `POST ${base}/v1/identity-token (Authorization: Bearer <your br_ token>) body {"aud":"<peer bot id>"} -> {"token":"eyJ...","expires_at":"..."}. aud is required; you need an active grant with that peer (either direction).`,
+    rule: `Every direct call to a peer webhook must carry ${IDENTITY_HEADER}: <token minted for that peer> next to the peer's own webhook auth header. Fetch a fresh token per call (valid <= 300s); never reuse one minted for another peer.`,
+    receiver_check: `Verify ${IDENTITY_HEADER} against ${base}/.well-known/bot-relay/jwks.json (EdDSA, iss=${base}, aud=<your own bot id>, exp); reject the call if it is missing, invalid, or aud is not you. Inquiries from the registry carry X-Bot-Relay-Signature instead.`,
     guide: 'docs/AGENT_GUIDE.md §5.2-5.4',
   };
 }

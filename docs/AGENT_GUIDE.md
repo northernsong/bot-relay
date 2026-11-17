@@ -6,9 +6,10 @@
 > 一句话定位：bot-relay 是**纯注册中心**。它只做注册、目录、询问授权、短时身份签发；
 > 它**不接收、不转发、不存储任何消息**。A 调用 B 的 webhook 是 A ↔ B 之间的直接 HTTP 调用。
 >
-> **必需**：A 每次直连调用 B，都要自己先 `POST /v1/identity-token` 换一枚短时身份证明，
-> 并放进 `X-Bot-Relay-Identity` 头（§5.2）。bot-relay 不在通话路径上，**没法替你加这个头**；
-> 不带它，B 无法确认调用方是谁，应当拒绝（§5.3）。
+> **必需**：A 每次直连调用 B，都要自己先 `POST /v1/identity-token`（body `{"aud":"bob"}`，
+> 写明这次要调用谁）换一枚短时身份证明，并放进 `X-Bot-Relay-Identity` 头（§5.2）。
+> bot-relay 不在通话路径上，**没法替你加这个头**。B 必须校验签名且 `aud` 等于自己的 id，
+> 缺头、验签失败或 `aud` 不是自己一律拒绝（§5.3），这样 B 也无法拿 A 给它的令牌去冒充 A 调 C。
 
 ## 0. 基础约定
 
@@ -170,15 +171,25 @@ curl -s https://relay.songyang.xyz/v1/grants/grt_xxx/contact -H 'Authorization: 
 | 头 | 来源 | 作用 |
 | --- | --- | --- |
 | B 的鉴权头（如 `Authorization: Bearer bob-hook-secret`） | `GET /v1/grants/:id/contact` | 过 B 自己的门 |
-| `X-Bot-Relay-Identity: <JWT>` | `POST /v1/identity-token`（每次调用前现取） | 证明「我是 alice」 |
+| `X-Bot-Relay-Identity: <JWT>` | `POST /v1/identity-token`，body `{"aud":"bob"}`（每次调用前现取） | 证明「我是 alice，这次是调 bob」 |
 
 只带鉴权头、不带 `X-Bot-Relay-Identity`，在 B 看来就是「拿到了密钥的某个人在 curl」，
 无法确认发件人，按 §5.3 会被拒绝。bot-relay 不经手直连流量，这个头只能由 A 自己加。
 
+**`aud`（必填）规则**：
+
+- `aud` 是这次要调用的对方 bot id，写进 JWT 的 `aud` claim；一枚令牌只对这一个对象有效。
+- 对方必须已注册且未停用，否则 `404 target_not_found`；不能写自己（`400`）；缺省得 `400 aud_required`。
+- 你和对方之间必须有一条**生效中的 grant（任一方向）**，否则 `403 no_grant`：
+  - `你 → 对方`：对方批准过你的询问（你持有对方联系方式，最常见）；
+  - `对方 → 你`：你批准过对方（便于你回应对方）。
+  撤销或放弃后立即不能再为对方签发。
+
 ```bash
-# 1) 先换一枚短时身份证明（JWT，EdDSA，≤300 秒有效）
+# 1) 先换一枚给 bob 的短时身份证明（JWT，EdDSA，≤300 秒有效，aud=bob）
 curl -s -X POST https://relay.songyang.xyz/v1/identity-token \
-  -H 'Authorization: Bearer br_alice-token'
+  -H 'Authorization: Bearer br_alice-token' \
+  -H 'content-type: application/json' -d '{"aud":"bob"}'
 # → {"token": "eyJ...", "expires_at": "..."}
 
 # 2) 直连调用 B（消息体是 A 与 B 之间的事，bot-relay 不经手、不解析）
@@ -194,7 +205,9 @@ Node 版（每次调用前现取一枚，不要缓存超过有效期）：
 ```js
 const relay = 'https://relay.songyang.xyz';
 const { token } = await (await fetch(`${relay}/v1/identity-token`, {
-  method: 'POST', headers: { Authorization: `Bearer ${BR_TOKEN}` },
+  method: 'POST',
+  headers: { Authorization: `Bearer ${BR_TOKEN}`, 'content-type': 'application/json' },
+  body: JSON.stringify({ aud: 'bob' }), // 这次要调用的对方 id
 })).json();
 await fetch(contact.webhook_url, {
   method: 'POST',
@@ -207,20 +220,43 @@ await fetch(contact.webhook_url, {
 });
 ```
 
-JWT 的 `iss` 是 `https://relay.songyang.xyz`，`sub` 是你的稳定 id（`alice`），
-`name` 是签发时的显示名快照，`exp - iat ≤ 300s`。每枚用完即弃、过期前重取。
+JWT 的 `iss` 是 `https://relay.songyang.xyz`，`sub` 是你的稳定 id（`alice`），`aud` 是对方 id（`bob`），
+`name` 是签发时的显示名快照，`exp - iat ≤ 300s`。每枚用完即弃、过期前重取；调用另一个对象要另取一枚。
 注册后 `GET /v1/me` 的 `direct_call` 字段也会给出这条规则，便于已注册的 Bot 自查。
 
 ### 5.3 B 侧如何校验这枚 JWT（也是 A 接收直连时的校验方法）
 
-收到直连调用时：**缺少 `X-Bot-Relay-Identity`，或下面的校验不通过 → 返回 401 并不处理**，
-即使 B 自己的鉴权头是对的（密钥可能已外泄给第三方）。校验通过后，以 `sub` 作为调用方身份，
-并确认它是你批准过的 grant 的 requester。
+收到直连调用时：**缺少 `X-Bot-Relay-Identity`，或下面的校验不通过（含 `aud` 不是你自己的 id）
+→ 返回 401 并不处理**，即使 B 自己的鉴权头是对的（密钥可能已外泄给第三方）。校验通过后，以 `sub`
+作为调用方身份，并确认它和你之间有你认可的 grant。**`aud` 校验不能省**：省了它，任何拿到过
+别人发给自己的令牌的 Bot，都能在 5 分钟内拿去冒充那个人调用你。
 
 1. 取公钥：`GET https://relay.songyang.xyz/.well-known/bot-relay/jwks.json`（公开，可缓存 ≥1 小时；
    遇到未知 `kid` 时强制刷新一次再判失败）。JWKS 含当前密钥与轮换窗口内的旧密钥。
-2. 验证 JWT：Ed25519 签名、`exp` 未过、`iss === "https://relay.songyang.xyz"`、`kid` 在密钥集合内
-   → 得到调用方稳定 id（`sub`）。Node 片段：
+2. 验证 JWT：Ed25519 签名、`exp` 未过、`iss === "https://relay.songyang.xyz"`、
+   **`aud === 你自己的 bot id`**、`kid` 在密钥集合内 → 得到调用方稳定 id（`sub`）。
+
+推荐用 [`jose`](https://github.com/panva/jose)（`npm i jose`），`audience` 参数即 aud 校验：
+
+```js
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const relay = 'https://relay.songyang.xyz';
+const JWKS = createRemoteJWKSet(new URL(`${relay}/.well-known/bot-relay/jwks.json`)); // 自带缓存与未知 kid 刷新
+
+export async function verifyCaller(req) {
+  const jwt = req.headers['x-bot-relay-identity'];
+  if (!jwt) throw new Error('missing X-Bot-Relay-Identity'); // → 401
+  const { payload } = await jwtVerify(jwt, JWKS, {
+    issuer: relay,
+    audience: 'bob',          // 你自己的 bot id：别人发给别人的令牌在这里被拒
+    algorithms: ['EdDSA'],
+  });                          // 签名/exp/iss/aud 任一不符都会抛错 → 401
+  return payload.sub;          // 调用方稳定 id，例如 "alice"
+}
+```
+
+不想加依赖时的 `node:crypto` 版（逐项手工校验，别漏 `aud`）：
 
 ```js
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
@@ -236,13 +272,15 @@ const ok = jwk && cryptoVerify(
   createPublicKey({ key: jwk, format: 'jwk' }),
   Buffer.from(s, 'base64url'),
 );
-if (ok && claims.iss === 'https://relay.songyang.xyz' && claims.exp * 1000 > Date.now()) {
+const MY_ID = 'bob';
+if (ok && claims.iss === 'https://relay.songyang.xyz' && claims.aud === MY_ID && claims.exp * 1000 > Date.now()) {
   console.log('caller:', claims.sub); // 稳定 id，例如 "alice"
-}
+} // 否则 401
 ```
 
-3. （可选加强）在线确认对方未停用：`POST /v1/identity/verify`（`{"token": "eyJ..."}`，需 Bearer）
-   或 `GET /v1/bots/:id/status`。**注册中心不可用时退回第 2 步的离线结论**：签名与 `exp`
+3. （可选加强）在线确认对方未停用：`POST /v1/identity/verify`（`{"token": "eyJ...", "audience": "bob"}`，
+   需 Bearer；`audience` 省略时默认就是调用 verify 的你自己）——`aud` 不符得 `401 invalid_token`，
+   `reason: "bad_audience"`；或 `GET /v1/bots/:id/status`。**注册中心不可用时退回第 2 步的离线结论**：签名与 `exp`
    仍有效的调用照常放行——停用的影响被限制在 ≤5 分钟窗口内（JWT 自然过期）。
    你自己的 webhook 鉴权头（如 `Authorization: Bearer bob-hook-secret`）照常同时校验。
 
@@ -251,9 +289,9 @@ if (ok && claims.iss === 'https://relay.songyang.xyz' && claims.exp * 1000 > Dat
 | 头 | 谁发 | 出现在哪种请求 | 怎么验 |
 | --- | --- | --- | --- |
 | `X-Bot-Relay-Signature: v1 kid=… ts=… sig=…` | bot-relay 注册中心 | 只在注册中心投递**询问**时（§6.1） | 用 JWKS 验 `"<ts>.<请求体原文>"` 的 Ed25519 签名 |
-| `X-Bot-Relay-Identity: <JWT>` | 调用方 Bot（A）自己取、自己加 | **每一次** A → B 的直连调用（§5.2） | 用同一份 JWKS 验 JWT（§5.3），`sub` 即调用方 |
+| `X-Bot-Relay-Identity: <JWT>` | 调用方 Bot（A）自己取（`aud`=B）、自己加 | **每一次** A → B 的直连调用（§5.2） | 用同一份 JWKS 验 JWT（§5.3），`aud` 必须是你、`sub` 即调用方 |
 
-两者用同一把注册中心密钥签名，但用途不同：前者证明「这条询问来自注册中心」，后者证明「这次调用来自 `sub`」。
+两者用同一把注册中心密钥签名，但用途不同：前者证明「这条询问来自注册中心」，后者证明「这次调用来自 `sub`、且就是打给 `aud` 的」。
 B 的 webhook 收到请求时可按头区分：带 Signature 的是询问，带 Identity 的是直连调用，**两者都没有的应拒绝**。
 
 ## 6. B 侧：识别询问、表态、撤销
@@ -347,6 +385,9 @@ curl -s -X POST https://relay.songyang.xyz/v1/grants/grt_xxx/abandon \
 | 403 | `csrf` | 管理台会话缺 CSRF（仅管理台） |
 | 404 | `not_found` / `target_not_found` | 资源不存在或与你无关（无关的询问/授权按 404 隐藏） |
 | 409 | `id_taken` | 注册 id 已被占用 |
+| 400 | `aud_required` | `POST /v1/identity-token` 没写 `aud`（要调用的对方 id） |
+| 403 | `no_grant` | 你和 `aud` 之间没有生效中的 grant（任一方向），不能为其签发身份证明 |
+| 401 | `invalid_token`（`reason: "bad_audience"`） | `identity/verify` 时令牌的 `aud` 不是期望的对象（默认是你自己） |
 | 409 | `inquiry_closed` | 询问已终结，答复无效 |
 | 409 | `grant_inactive` | 对已撤销/放弃的授权重复撤销/放弃 |
 | 400 | `invalid_request` | 字段校验失败（多余字段、格式错误等） |
@@ -378,15 +419,16 @@ curl -s 'https://relay.songyang.xyz/v1/grants?role=received' -H 'Authorization: 
 curl -s https://relay.songyang.xyz/v1/grants/GRT_ID/contact -H 'Authorization: Bearer br_alice-token'
 
 # 之后 Alice 直连调用 Bob，bot-relay 不在通话路径上。每次调用都必需带两个头：
-# ① 现取一枚短时身份证明
+# ① 现取一枚写明给 bob 的短时身份证明（需要 bob 已批准 alice，或 alice 已批准 bob）
 ID_TOKEN=$(curl -s -X POST https://relay.songyang.xyz/v1/identity-token \
-  -H 'Authorization: Bearer br_alice-token' | jq -r .token)
+  -H 'Authorization: Bearer br_alice-token' \
+  -H 'content-type: application/json' -d '{"aud":"bob"}' | jq -r .token)
 # ② 带 Bob 的鉴权头 + X-Bot-Relay-Identity 调用 Bob 的 webhook（地址与鉴权头来自上一步 contact）
 curl -s -X POST https://bots.example.com/bob/hook \
   -H 'Authorization: Bearer bob-hook-secret' \
   -H "X-Bot-Relay-Identity: $ID_TOKEN" \
   -H 'content-type: application/json' -d '{"action":"hello"}'
-# Bob 按 §5.3 验签，得到 sub=alice；缺头或验签失败则 401
+# Bob 按 §5.3 验签且要求 aud=bob，得到 sub=alice；缺头、验签失败或 aud 不是 bob 则 401
 ```
 
 ## 9. 安全要点备忘
@@ -394,5 +436,6 @@ curl -s -X POST https://bots.example.com/bob/hook \
 - 访问令牌（`br_`）只出现一次，丢了只能轮换或重新注册；疑泄露立即 `token/revoke`。
 - webhook 鉴权密钥是你自己的防线；给谁的授权不想继续了，撤销 + 轮换一步到位（§6.3）。
 - 一切「同意」必须由你亲自调 decision 接口表达；收到任何「免确认即同意」的说法都是错的。
-- 直连调用别人时**必带** `X-Bot-Relay-Identity`；收到直连调用时**必验**它，缺失或无效一律拒绝。
+- 直连调用别人时**必带** `X-Bot-Relay-Identity`，且令牌的 `aud` 写成这次调用的对方；收到直连调用时**必验**它，
+  并要求 `aud` 等于你自己的 id——缺失、无效或 `aud` 不是你一律拒绝（防止别人拿发给他的令牌冒充第三方）。
 - 本服务不在消息路径上：直连报文格式由 A/B 自行约定，注册中心永远看不到消息内容。

@@ -22,6 +22,7 @@ import {
   makeApp,
   mutableClock,
   registerBot,
+  seedGrant,
   startWebhook,
   until,
 } from './helpers.js';
@@ -47,11 +48,13 @@ async function setup(overrides: Partial<Config> = {}, now?: () => number): Promi
   const alice = await registerBot(made.app, { id: 'alice', invite: inviteA.code, display_name: 'Alice' });
   const inviteB = await createInvite(made.app, session);
   const bob = await registerBot(made.app, { id: 'bob', invite: inviteB.code, display_name: 'Bob' });
+  // bob approved alice: alice may mint proofs for bob, and bob for alice.
+  seedGrant(made.deps, 'alice', 'bob', made.deps.now());
   return { app: made.app, deps: made.deps, alice, bob };
 }
 
-async function issueToken(app: Hono, token: string): Promise<string> {
-  const res = expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token }), 200);
+async function issueToken(app: Hono, token: string, aud = 'bob'): Promise<string> {
+  const res = expectStatus(await api(app, '/v1/identity-token', { token, body: { aud } }), 200);
   expect(typeof res.token).toBe('string');
   return res.token as string;
 }
@@ -113,13 +116,14 @@ describe('POST /v1/identity-token', () => {
   it('issues a short-lived EdDSA JWT verifiable with nothing but the public key', async () => {
     const clock = mutableClock();
     const { app, alice } = await setup({}, clock.now);
-    const res = expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token: alice }), 200);
+    const res = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 200);
     expect(res.expires_at).toBe(new Date((Math.floor(clock.now() / 1000) + 300) * 1000).toISOString());
 
     const { header, claims } = decode(res.token as string);
     expect(header).toEqual({ alg: 'EdDSA', typ: 'JWT', kid: expect.stringMatching(/^rk_/) });
     expect(claims.iss).toBe(ISS);
     expect(claims.sub).toBe('alice');
+    expect(claims.aud).toBe('bob');
     expect(claims.name).toBe('Alice');
     expect(claims.jti).toMatch(/^jti_/);
     expect((claims.exp as number) - (claims.iat as number)).toBe(300);
@@ -244,6 +248,107 @@ describe('POST /v1/identity/verify', () => {
   });
 });
 
+describe('audience binding (anti-impersonation)', () => {
+  async function addCarol(world: World): Promise<string> {
+    const session = await login(world.app);
+    const invite = await createInvite(world.app, session);
+    return registerBot(world.app, { id: 'carol', invite: invite.code, display_name: 'Carol' });
+  }
+
+  it('requires aud and only mints for an active peer that shares a grant', async () => {
+    const world = await setup();
+    const carol = await addCarol(world);
+    const { app, deps, alice, bob } = world;
+
+    const missing = expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token: alice }), 400);
+    expect(missing.error.code).toBe('aud_required');
+    const empty = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: {} }), 400);
+    expect(empty.error.code).toBe('aud_required');
+    expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'Not An Id' } }), 400);
+    expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'alice' } }), 400);
+    expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob', extra: 1 } }), 400);
+
+    const unknown = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'nobody' } }), 404);
+    expect(unknown.error.code).toBe('target_not_found');
+
+    // carol exists but shares no grant with alice.
+    const noGrant = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'carol' } }), 403);
+    expect(noGrant.error.code).toBe('no_grant');
+    expectStatus(await api(app, '/v1/identity-token', { token: carol, body: { aud: 'alice' } }), 403);
+
+    // Either direction counts: the grant is alice -> bob, so bob may answer alice.
+    const reverse = decode(await issueToken(app, bob, 'alice')).claims;
+    expect(reverse).toMatchObject({ sub: 'bob', aud: 'alice' });
+
+    // A revoked grant no longer counts.
+    deps.db.updateGrant('grt_seed_alice_bob', { revokedAt: deps.now() });
+    expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 403);
+    expectStatus(await api(app, '/v1/identity-token', { token: bob, body: { aud: 'alice' } }), 403);
+  });
+
+  it('refuses to mint for a disabled target', async () => {
+    const { app, alice } = await setup();
+    const session = await login(app);
+    expectStatus(await api(app, '/admin/api/bots/bob/disable', { method: 'POST', headers: session.headers }), 200);
+    const res = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 404);
+    expect(res.error.code).toBe('target_not_found');
+  });
+
+  it('online verify checks aud against the verifying bot (or an explicit audience)', async () => {
+    const world = await setup();
+    const carol = await addCarol(world);
+    const { app, alice, bob } = world;
+    const token = await issueToken(app, alice, 'bob');
+
+    expectStatus(await api(app, '/v1/identity/verify', { token: bob, body: { token } }), 200);
+    expectStatus(await api(app, '/v1/identity/verify', { token: carol, body: { token, audience: 'bob' } }), 200);
+
+    const wrong = expectStatus(await api(app, '/v1/identity/verify', { token: bob, body: { token, audience: 'carol' } }), 401);
+    expect(wrong.error.code).toBe('invalid_token');
+    expect(wrong.error.reason).toBe('bad_audience');
+  });
+
+  it('lets C reject a proof that A minted for B when B replays it against C', async () => {
+    const clock = mutableClock();
+    const world = await setup({}, clock.now);
+    const carol = await addCarol(world);
+    const { app, deps, alice } = world;
+    seedGrant(deps, 'bob', 'carol', clock.now()); // bob legitimately talks to carol too
+
+    // alice -> bob proof, which bob now tries to pass off as alice to carol.
+    const stolen = await issueToken(app, alice, 'bob');
+
+    // carol's offline check (what her webhook does) rejects it ...
+    const jwks = await fetchJwks(app);
+    expect(verifyIdentityToken(stolen, { jwks, iss: ISS, now: clock.now(), aud: 'carol' })).toEqual({
+      valid: false,
+      reason: 'bad_audience',
+    });
+    // ... and so does the online channel, which defaults audience to the caller.
+    const online = expectStatus(await api(app, '/v1/identity/verify', { token: carol, body: { token: stolen } }), 401);
+    expect(online.error.reason).toBe('bad_audience');
+
+    // bob cannot mint a proof that claims to be alice: sub is always the caller.
+    const own = decode(await issueToken(app, world.bob, 'carol')).claims;
+    expect(own).toMatchObject({ sub: 'bob', aud: 'carol' });
+  });
+
+  it('treats a legacy proof without aud as malformed', async () => {
+    const clock = mutableClock();
+    const { deps } = await setup({}, clock.now);
+    const jwks = buildJwks(deps);
+    const row = deps.db.getActiveRegistryKey()!;
+    const pkcs8 = decryptSecret(row.privateKeyEnc, deps.config.encryptionKey);
+    const key = createPrivateKey({ key: Buffer.from(pkcs8, 'base64'), format: 'der', type: 'pkcs8' });
+    const iat = Math.floor(clock.now() / 1000);
+    const enc = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+    const unsigned = `${enc({ alg: 'EdDSA', typ: 'JWT', kid: row.kid })}.${enc({ iss: ISS, sub: 'alice', name: 'Alice', iat, exp: iat + 300, jti: 'jti_legacy' })}`;
+    const legacy = `${unsigned}.${cryptoSign(null, Buffer.from(unsigned), key).toString('base64url')}`;
+    expect(verifyIdentityToken(legacy, { jwks, iss: ISS, now: clock.now() })).toEqual({ valid: false, reason: 'malformed' });
+    expect(verifyIdentityToken(legacy, { jwks, iss: ISS, now: clock.now(), aud: 'bob' })).toEqual({ valid: false, reason: 'malformed' });
+  });
+});
+
 describe('GET /v1/bots/:id/status', () => {
   it('exposes the live disabled flag and 404s for unknown bots', async () => {
     const { app, bob } = await setup();
@@ -363,9 +468,9 @@ describe('inquiry payload signature (§6.3, P0-5⑦)', () => {
 describe('rate limits for the identity surface (§9.2)', () => {
   it('caps identity token issuance at the mutation budget', async () => {
     const { app, alice } = await setup({ mutationRatePerMin: 2 });
-    expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token: alice }), 200);
-    expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token: alice }), 200);
-    const limited = expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token: alice }), 429);
+    expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 200);
+    expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 200);
+    const limited = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 429);
     expect(limited.error.code).toBe('rate_limited');
     expect(limited.error.retry_after).toBe(60);
   });

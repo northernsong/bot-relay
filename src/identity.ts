@@ -32,13 +32,15 @@ export type JwkSet = { keys: Jwk[] };
 export type IdentityClaims = {
   iss: string;
   sub: string;
+  /** The one bot this proof is meant for; receivers require aud === own id. */
+  aud: string;
   name: string;
   iat: number;
   exp: number;
   jti: string;
 };
 
-export type TokenInvalidReason = 'malformed' | 'unknown_kid' | 'bad_signature' | 'expired' | 'wrong_iss';
+export type TokenInvalidReason = 'malformed' | 'unknown_kid' | 'bad_signature' | 'expired' | 'wrong_iss' | 'bad_audience';
 export type TokenVerifyResult = { valid: true; claims: IdentityClaims } | { valid: false; reason: TokenInvalidReason };
 
 export type InquirySignatureResult =
@@ -96,7 +98,7 @@ export function buildJwks(deps: Deps): JwkSet {
  * caller is a registered, non-disabled bot. Disabled bots never reach this —
  * the route rejects them before signing.
  */
-export function issueIdentityToken(deps: Deps, bot: Bot): { token: string; expiresAt: number } {
+export function issueIdentityToken(deps: Deps, bot: Bot, aud: string): { token: string; expiresAt: number } {
   const key = ensureSigningKey(deps);
   const iat = Math.floor(deps.now() / 1000);
   const exp = iat + deps.config.identityTokenTtlSec;
@@ -104,6 +106,7 @@ export function issueIdentityToken(deps: Deps, bot: Bot): { token: string; expir
   const claims: IdentityClaims = {
     iss: deps.config.publicBaseUrl,
     sub: bot.id,
+    aud,
     name: bot.displayName,
     iat,
     exp,
@@ -116,10 +119,15 @@ export function issueIdentityToken(deps: Deps, bot: Bot): { token: string; expir
 
 /**
  * Offline verification exactly as the called bot performs it (§7.3): Ed25519
- * signature against the JWKS, `exp` freshness, expected `iss`, known `kid`.
- * Registry availability is never required — a valid proof stays valid.
+ * signature against the JWKS, `exp` freshness, expected `iss`, known `kid`,
+ * and — when `aud` is given — that the proof was minted for that bot. A
+ * receiver always passes its own id, so a proof A minted for B cannot be
+ * replayed by B against C. Registry availability is never required.
  */
-export function verifyIdentityToken(token: string, opts: { jwks: JwkSet; iss: string; now: number }): TokenVerifyResult {
+export function verifyIdentityToken(
+  token: string,
+  opts: { jwks: JwkSet; iss: string; now: number; aud?: string },
+): TokenVerifyResult {
   const parts = token.split('.');
   if (parts.length !== 3) return { valid: false, reason: 'malformed' };
   let header: unknown;
@@ -137,6 +145,7 @@ export function verifyIdentityToken(token: string, opts: { jwks: JwkSet; iss: st
   if (
     typeof claims.iss !== 'string' ||
     typeof claims.sub !== 'string' ||
+    typeof claims.aud !== 'string' ||
     typeof claims.name !== 'string' ||
     typeof claims.iat !== 'number' ||
     typeof claims.exp !== 'number' ||
@@ -150,6 +159,7 @@ export function verifyIdentityToken(token: string, opts: { jwks: JwkSet; iss: st
   if (!signatureOk) return { valid: false, reason: 'bad_signature' };
   if (claims.exp * 1000 <= opts.now) return { valid: false, reason: 'expired' };
   if (claims.iss !== opts.iss) return { valid: false, reason: 'wrong_iss' };
+  if (opts.aud !== undefined && claims.aud !== opts.aud) return { valid: false, reason: 'bad_audience' };
   return { valid: true, claims: claims as unknown as IdentityClaims };
 }
 

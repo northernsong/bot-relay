@@ -293,7 +293,7 @@ flowchart LR
 
 | 方法 路径 | 鉴权 | 请求 → 响应 | 关键错误 |
 | --- | --- | --- | --- |
-| `POST /v1/identity-token` | Bot 令牌（未停用） | → `{token:"<JWT>", expires_at}`。JWT 为标准 EdDSA 紧凑格式，有效期 `IDENTITY_TOKEN_TTL_SEC`（默认 300s，上限 300s，P0-7②） | `403 bot_disabled`（停用后不再签发） |
+| `POST /v1/identity-token` | Bot 令牌（未停用） | `{aud:"<目标 bot id>"}`（必填）→ `{token:"<JWT>", expires_at}`。JWT 为标准 EdDSA 紧凑格式，含 `aud`，有效期 `IDENTITY_TOKEN_TTL_SEC`（默认 300s，上限 300s，P0-7②） | `403 bot_disabled`；`400 aud_required`；`404 target_not_found`（不存在/已停用）；`403 no_grant`（双方无生效 grant） |
 | `POST /v1/identity/verify` | Bot 令牌 | `{token}` → `{valid:bool, id, display_name, disabled}`。**在线核实通道**（被调方 stricter 模式用；也可只用 JWKS 离线验签，见 §7） | `401 invalid_token`（格式/签名/过期无效） |
 | `GET /v1/bots/:id/status` | Bot 令牌 | → `{id, display_name, disabled}`（停用状态实时查询，配合 P0-7② 在线吊销） | `404 not_found` |
 
@@ -426,6 +426,7 @@ sequenceDiagram
 
 - 注册中心首启生成 **Ed25519** 密钥对（`registry_keys` 表，私钥加密存库），`kid` 标识；此后用它签发两种东西：①Bot 身份证明（JWT）；②询问出站报文签名（§6.3）。**选非对称签名而非 HMAC 的原因**：若用对称密钥，每个 Bot 都要持注册中心主密钥才能互相验证，任何 Bot 即可伪造任意其他 Bot 的身份；非对称下 Bot 只需公开公钥即可验证，无法伪造。
 - A 调用 B 的 webhook 时，在 B 的鉴权头之外**必须**带上身份证明，放独立头：`X-Bot-Relay-Identity: <JWT>`（不影响 B 自己的 webhook 鉴权头）；B 对缺失或无效者应拒绝。注册中心不在通话路径上，无法代加，故在接入指南、注册 `next_steps` 与 `GET /v1/me.direct_call` 中明示。
+- **受众绑定（防冒充）**：签发时必填 `aud`（目标 bot id，须已注册、未停用，且与调用方之间有生效 grant，任一方向），写入 JWT `aud` claim；接收方必须校验 `aud === 自己的 id`，否则拒绝。这样 B 无法把 A 发给 B 的令牌转手去冒充 A 调用 C。`POST /v1/identity/verify` 支持 `audience`（缺省为调用者自己），不符返回 `401 invalid_token`（`reason: bad_audience`）。上线即必填、无过渡期（当时仅两个自有 Bot，旧令牌 ≤300s 自然失效）。
 
 ### 7.2 身份证明（JWT / EdDSA）
 
@@ -435,17 +436,17 @@ sequenceDiagram
 // header
 {"alg":"EdDSA","typ":"JWT","kid":"rk_2026a"}
 // claims
-{"iss":"https://relay.songyang.xyz","sub":"alice","name":"Alice",
+{"iss":"https://relay.songyang.xyz","sub":"alice","aud":"bob","name":"Alice",
  "iat":1763000000,"exp":1763000300,"jti":"jti_…"}
 ```
 
-- `iss` = `PUBLIC_BASE_URL`（注册中心对外 origin，本实例默认写死 `https://relay.songyang.xyz`，决策 D1）；`sub` = 调用方 Bot id（稳定 id，P0-7①）；`name` = 签发时显示名快照；`exp - iat = IDENTITY_TOKEN_TTL_SEC`，**默认与上限均 300s**（P0-7②）。
-- 签发：`POST /v1/identity-token`（A 的访问令牌换 JWT），被停用 Bot 拒绝签发。
+- `iss` = `PUBLIC_BASE_URL`（注册中心对外 origin，本实例默认写死 `https://relay.songyang.xyz`，决策 D1）；`sub` = 调用方 Bot id（稳定 id，P0-7①）；`aud` = 本次调用的目标 Bot id（必填，防转手冒充）；`name` = 签发时显示名快照；`exp - iat = IDENTITY_TOKEN_TTL_SEC`，**默认与上限均 300s**（P0-7②）。
+- 签发：`POST /v1/identity-token`（A 的访问令牌 + `{"aud":"<目标 id>"}` 换 JWT），被停用 Bot 拒绝签发；目标须存在、未停用，且与 A 有生效 grant（任一方向）。
 
 ### 7.3 被调方（B）的校验流程（写入 Agent 接入文档，P0-7③）
 
 1. 取公钥：`GET /.well-known/bot-relay/jwks.json`（公网可读；按 `kid` 匹配，本地缓存 ≥1 小时，验签失败时强制刷新一次）。
-2. 验证 JWT：Ed25519 签名、`exp` 未过、`iss` 是自己登记的注册中心 origin、`kid` 在密钥集合内 → 得到调用方 `sub`（稳定 id）。
+2. 验证 JWT：Ed25519 签名、`exp` 未过、`iss` 是自己登记的注册中心 origin、`aud` 等于自己的 id、`kid` 在密钥集合内 → 得到调用方 `sub`（稳定 id）。
 3. （可选加强）`POST /v1/identity/verify` 或 `GET /v1/bots/:id/status` 在线确认未停用。**注册中心不可用时退回第 2 步的离线结论**：签名与 `exp` 仍有效的调用放行——这满足 P0-7④，停用影响被限制在 ≤5 分钟窗口内（P0-7②）。
 4. 本服务全程不在通话路径上（P0-7⑤）：校验只消费 HTTP 头里的 JWT，消息体是 A↔B 之间的事。
 

@@ -214,3 +214,24 @@ export async function startWebhook(opts?: { statuses?: number[]; hang?: boolean 
     },
   };
 }
+
+/**
+ * Seed an active grant (requester got target's contact) straight into the
+ * database, for tests that need a direct-call relationship without walking
+ * the inquiry flow.
+ */
+export function seedGrant(deps: Deps, requesterId: string, targetId: string, now = Date.now()): string {
+  const id = `grt_seed_${requesterId}_${targetId}`;
+  deps.db.insertGrant({
+    id,
+    requesterId,
+    targetId,
+    inquiryId: `inq_seed_${requesterId}_${targetId}`,
+    grantedAt: now,
+    revokedAt: null,
+    abandonedAt: null,
+    refreshedAt: null,
+    refreshedContactVersion: null,
+  });
+  return id;
+}

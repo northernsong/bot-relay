@@ -9,6 +9,7 @@ import {
   makeApp,
   mutableClock,
   registerBot,
+  seedGrant,
   startWebhook,
   until,
 } from './helpers.js';
@@ -67,12 +68,16 @@ describe('GET /metrics (P0-11)', () => {
     expectStatus(await api(app, '/v1/directory', { token: alice }), 200);
     expectStatus(await api(app, '/v1/directory/bob', { token: alice }), 200);
 
-    const proof = expectStatus(await api(app, '/v1/identity-token', { method: 'POST', token: alice }), 200);
+    // Reverse-direction grant (bob holds alice's contact) so the inquiry below stays new.
+    const seeded = seedGrant(deps, 'bob', 'alice');
+    const proof = expectStatus(await api(app, '/v1/identity-token', { token: alice, body: { aud: 'bob' } }), 200);
     expectStatus(
-      await api(app, '/v1/identity/verify', { token: alice, body: { token: (proof as { token: string }).token } }),
+      await api(app, '/v1/identity/verify', { token: bob, body: { token: (proof as { token: string }).token } }),
       200,
     );
     expectStatus(await api(app, '/v1/identity/verify', { token: alice, body: { token: 'garbage' } }), 401);
+    // Retire the seeded grant so the grant gauges below only count the real flow.
+    deps.db.updateGrant(seeded, { abandonedAt: deps.now() });
 
     const created = expectStatus(await api(app, '/v1/inquiries', { token: alice, body: { to: 'bob' } }), 202);
     const inquiryId = created.inquiry.id as string;

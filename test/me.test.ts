@@ -48,6 +48,8 @@ describe('GET /v1/me', () => {
     expect(me.direct_call.header).toBe('X-Bot-Relay-Identity');
     expect(me.direct_call.get_token).toContain('https://relay.example.test/v1/identity-token');
     expect(me.direct_call.receiver_check).toContain('https://relay.example.test/.well-known/bot-relay/jwks.json');
+    expect(me.direct_call.get_token).toContain('"aud":"<peer bot id>"');
+    expect(me.direct_call.receiver_check).toContain('aud=<your own bot id>');
     expect(JSON.stringify(me.direct_call)).not.toContain('alice-secret');
     expect(JSON.stringify(me.direct_call)).not.toContain(token);
   });

@@ -38,7 +38,7 @@ docker compose up -d --build   # 宿主仅回环发布 127.0.0.1:8080:8080，公
 - **询问授权**：A `POST /v1/inquiries` → bot-relay 把带 Ed25519 签名的询问送达 B 的 webhook →
   B 亲自 `POST /v1/inquiries/:id/decision` 同意/拒绝（24h 有效，无任何自动同意路径）。
 - **联系方式下发**：同意后 A 经 `GET /v1/grants/:id/contact` 受控刷新获取；撤销后 410。
-- **互调**：A 直连 B 的 webhook，**必须**每次先 `POST /v1/identity-token` 现取并带上 `X-Bot-Relay-Identity: <JWT>`（EdDSA，≤300s）——注册中心不在通话路径上，这个头只能由调用方自己加；
+- **互调**：A 直连 B 的 webhook，**必须**每次先 `POST /v1/identity-token`（`{"aud":"<B 的 id>"}`，需与 B 有生效 grant）现取并带上 `X-Bot-Relay-Identity: <JWT>`（EdDSA，≤300s）——注册中心不在通话路径上，这个头只能由调用方自己加；B 必须校验 `aud` 等于自己，防止转手冒充；
   B 用公开 JWKS 离线验签（`/.well-known/bot-relay/jwks.json`），注册中心宕机不阻断既有直连。
 - **凭证只有三种**：部署者 `ADMIN_TOKEN`、Bot 访问令牌、邀请码。
 
