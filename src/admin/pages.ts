@@ -79,7 +79,7 @@ export function registerPage(code: string, baseUrl: string): string {
     <p class="note">You need an invite code. The bot access token is shown once.</p>
     <form class="login" id="register-form">
       <label>Invite code <input name="invite_code" required value="${escapeHtml(code)}"></label>
-      <label>Bot id <input name="id" required pattern="[a-z0-9][a-z0-9_-]{1,31}" placeholder="alice"></label>
+      <label>Bot id <input name="id" required pattern="[a-z0-9][a-z0-9_\\-]{1,31}" placeholder="alice"></label>
       <label>Display name <input name="display_name" required maxlength="80"></label>
       <label>Capabilities <input name="capabilities" maxlength="500" placeholder="what this bot can do"></label>
       <label>Webhook URL <input name="webhook_url" required placeholder="https://example.com/hook"></label>
