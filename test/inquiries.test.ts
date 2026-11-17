@@ -97,6 +97,8 @@ describe('end-to-end: register, discover, inquire, approve, fetch contact', () =
     // The outbound inquiry is signed with the registry Ed25519 key (P0-5⑦);
     // full verification lives in test/identity.test.ts.
     expect(String(hit.headers['x-bot-relay-signature'])).toMatch(/^v1 kid=rk_[0-9a-f]{16} ts=\d+ sig=[A-Za-z0-9_-]+$/);
+    // Bob's own webhook auth header rides along, like for any other caller.
+    expect(hit.headers.authorization).toBe('Bearer bob-secret');
     const payload = JSON.parse(hit.body) as Record<string, unknown>;
     expect(payload).toMatchObject({ type: 'inquiry', to: 'bob', from: 'alice', inquiry_id: inquiryId });
     expect(typeof payload.expires_at).toBe('string');
@@ -150,6 +152,28 @@ describe('delivery outcomes (delivering -> pending | undelivered)', () => {
     expect(world.hook.hits).toHaveLength(1);
     const inquiry = expectStatus(await api(world.app, `/v1/inquiries/${created.inquiry.id}`, { token: world.alice }), 200);
     expect(inquiry.inquiry.delivery_error).toBe('http_5xx');
+  });
+
+  it('classifies a 4xx rejection as http_4xx, not http_5xx', async () => {
+    const world = await makeWorld({ webhook: { statuses: [401] } });
+    open.push({ close: async () => { await world.hook.close(); world.deps.db.close(); } });
+    const created = expectStatus(await inquire(world.app, world.alice), 202);
+    await waitForStatus(world.deps, created.inquiry.id as string, 'undelivered');
+    expect(world.hook.hits).toHaveLength(1);
+    const inquiry = expectStatus(await api(world.app, `/v1/inquiries/${created.inquiry.id}`, { token: world.alice }), 200);
+    expect(inquiry.inquiry.delivery_error).toBe('http_4xx');
+  });
+
+  it('sends no auth header when the target registered none', async () => {
+    const { app, deps } = makeApp();
+    const hook = await startWebhook();
+    open.push({ close: async () => { await hook.close(); deps.db.close(); } });
+    const alice = await newBot(app, 'alice');
+    await newBot(app, 'dave', { webhook_url: hook.url });
+    const created = expectStatus(await inquire(app, alice, 'dave'), 202);
+    await waitForStatus(deps, created.inquiry.id as string, 'pending');
+    expect(hook.hits).toHaveLength(1);
+    expect(hook.hits[0]!.headers.authorization).toBeUndefined();
   });
 
   it('marks undelivered on timeout without retrying', async () => {

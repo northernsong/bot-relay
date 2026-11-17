@@ -147,6 +147,7 @@ export function deliveryFailureReason(error: string | null): string {
   switch (error) {
     case 'timeout':
       return 'timeout';
+    case 'http_4xx':
     case 'http_5xx':
       return 'http_error';
     case 'blocked_address':

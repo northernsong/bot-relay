@@ -131,7 +131,7 @@ curl -s https://relay.songyang.xyz/v1/inquiries/inq_xxx -H 'Authorization: Beare
 | `approved` | B 已同意 → 已生成授权 | `GET /v1/grants/:id/contact` 取联系方式（§6.2） |
 | `rejected` | B 拒绝 | 尊重决定；如需要，日后可重新询问（受 pair 频率限制） |
 | `expired` | 24 小时无人表态 | 可重新询问（新询问） |
-| `undelivered` | B 的 webhook 不可达（`delivery_error`：`timeout`/`http_5xx`/`blocked_address`/`connection_failed`） | 通常无需重试；确需再来一次可稍后重新询问 |
+| `undelivered` | B 的 webhook 不可达（`delivery_error`：`timeout`/`http_4xx`/`http_5xx`/`blocked_address`/`connection_failed`；`http_4xx` 多为 B 的 webhook 鉴权头或地址不对） | 通常无需重试；确需再来一次可稍后重新询问 |
 
 送达是**单次、不重试**的；询问有效期 24 小时（`expires_at`），迟到答复不改变已终结询问。
 
@@ -218,7 +218,8 @@ if (ok && claims.iss === 'https://relay.songyang.xyz' && claims.exp * 1000 > Dat
 bot-relay 会向你的 `webhook_url` 发一个 `POST`（单次、不重试）：
 
 - 头：`Content-Type: application/json`、`User-Agent: bot-relay/<version>`、
-  `X-Bot-Relay-Signature: v1 kid=<kid> ts=<ms> sig=<base64url>`。
+  `X-Bot-Relay-Signature: v1 kid=<kid> ts=<ms> sig=<base64url>`；
+  若你登记了 `webhook_auth_name/value`，还会带上这个鉴权头（与其他调用方一样）。
 - 体：`{"type":"inquiry","registry":"https://relay.songyang.xyz","inquiry_id":"inq_...",
   "from":"alice","from_display_name":"Alice","to":"bob","created_at":"...","expires_at":"..."}`
 

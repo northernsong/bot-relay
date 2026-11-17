@@ -282,17 +282,25 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
       expires_at: iso(inquiry.expiresAt),
     });
     const signature = signInquiryPayload(deps, payload);
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'user-agent': `bot-relay/${VERSION}`,
+      'x-bot-relay-signature': signature,
+    };
+    // The target registered this header as the gate every caller of its
+    // webhook must pass (AGENT_GUIDE §2: "谁调用你的 webhook 都要带这个头");
+    // the registry's inquiry POST is such a call. Without it, auth-gated
+    // receivers such as Grok Bot webhook routines reject every inquiry.
+    if (target.webhookAuthName !== '' && target.webhookAuthValueEnc !== '') {
+      headers[target.webhookAuthName] = decryptSecret(target.webhookAuthValueEnc, deps.config.encryptionKey);
+    }
     let response: Response;
     try {
       response = await pinnedFetch(
         url,
         {
           method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'user-agent': `bot-relay/${VERSION}`,
-            'x-bot-relay-signature': signature,
-          },
+          headers,
           body: payload,
         },
         {
@@ -327,7 +335,11 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
         });
       }
     } else {
-      markUndelivered(deps, inquiryId, 'http_5xx');
+      // Status only: never the URL, headers or body of the receiver.
+      console.warn(
+        JSON.stringify({ level: 'warn', msg: 'inquiry_delivery_rejected', inquiry_id: inquiryId, target: target.id, status: response.status }),
+      );
+      markUndelivered(deps, inquiryId, response.status >= 500 ? 'http_5xx' : 'http_4xx');
     }
   } catch (err) {
     // Never let a background delivery crash the process; state stays delivering

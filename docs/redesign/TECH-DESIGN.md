@@ -183,7 +183,7 @@ flowchart LR
 | `status` | TEXT NOT NULL | `delivering` → `pending` → `approved`\|`rejected`\|`expired`；`delivering` → `undelivered`（§6.1） |
 | `created_at` / `expires_at` | INTEGER NOT NULL | `expires_at = created_at + INQUIRY_TTL_SEC`（默认 24h，不因任何操作重置） |
 | `delivered_at` / `decided_at` | INTEGER NULL | 送达成功时间 / B 答复时间 |
-| `delivery_error` | TEXT NULL | 未送达原因分类（`timeout` / `http_5xx` / `blocked_address` / `connection_failed`），脱敏摘要 |
+| `delivery_error` | TEXT NULL | 未送达原因分类（`timeout` / `http_4xx` / `http_5xx` / `blocked_address` / `connection_failed`），脱敏摘要 |
 
 索引：`UNIQUE idx_inquiry_active(requester_id, target_id) WHERE status IN ('delivering','pending')`（数据库层保证「同一对至多一条活跃询问」）；`idx_inquiry_target(target_id, status)`（B 查看待确认）。
 
