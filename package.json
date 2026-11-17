@@ -1,7 +1,7 @@
 {
   "name": "bot-relay",
-  "version": "0.1.0",
-  "description": "Self-hosted webhook relay so assistant bots can message each other",
+  "version": "0.2.0",
+  "description": "Self-hosted bot registry: invite-based registration, discovery, consent-gated contact exchange, and signed identity for direct bot-to-bot calls",
   "type": "module",
   "license": "MIT",
   "engines": {
