@@ -26,10 +26,20 @@ export type OpenResult =
   | { kind: 'created'; inquiry: Inquiry };
 
 /**
+ * Rate-limit callbacks supplied by the route (design §9.2): a brand-new
+ * inquiry pays the "initiate inquiry" budget, a controlled refresh through an
+ * active grant pays the refresh budget shared with GET /v1/grants/:id/contact.
+ */
+export type InquiryLimits = {
+  limitNew: () => void;
+  limitRefresh: () => void;
+};
+
+/**
  * POST /v1/inquiries acceptance + dedup rules (design §5.4). Fully synchronous
  * so the database-level unique active index guarantees the pair invariant.
  */
-export function openInquiry(deps: Deps, requester: Bot, to: unknown): OpenResult {
+export function openInquiry(deps: Deps, requester: Bot, to: unknown, limits: InquiryLimits): OpenResult {
   if (typeof to !== 'string' || to.trim() === '') {
     throw new HttpError(400, 'invalid_request', '"to" must be the id of the bot to inquire');
   }
@@ -46,11 +56,17 @@ export function openInquiry(deps: Deps, requester: Bot, to: unknown): OpenResult
   const grant = deps.db.findGrantByPair(requester.id, targetId);
   if (grant && grant.revokedAt === null && grant.abandonedAt === null) {
     if (target.disabled) throw new HttpError(410, 'grant_inactive', 'The target bot is disabled');
+    // Controlled refresh: charged to the refresh budget (30/min), not the
+    // stricter "initiate inquiry" budget (F1, design §9.2).
+    limits.limitRefresh();
     const now = deps.now();
     deps.db.updateGrant(grant.id, { refreshedAt: now, refreshedContactVersion: target.contactVersion });
     deps.metrics?.inc('grants_refresh_total');
     return { kind: 'contact', grantId: grant.id, contact: buildContact(deps, target, now) };
   }
+
+  // Not a refresh, so this request pays the "initiate inquiry" budget.
+  limits.limitNew();
 
   // Rule 2: active inquiry -> return it as-is, no new row, no reset of expires_at.
   const active = deps.db.getActiveInquiry(requester.id, targetId);
@@ -207,9 +223,28 @@ export function startInquirySweeper(deps: Deps): { stop: () => void; sweep: () =
 
 function scheduleDelivery(deps: Deps, inquiryId: string): void {
   // The acceptance response never waits for the outbound call (design §6.3).
+  const tasks = (deps.inflight ??= new Set<Promise<unknown>>());
   setImmediate(() => {
-    void deliverInquiry(deps, inquiryId);
+    const task = deliverInquiry(deps, inquiryId).finally(() => {
+      tasks.delete(task);
+    });
+    tasks.add(task);
   });
+}
+
+/**
+ * Shutdown handoff (F5): stop the sweeper and wait for in-flight deliveries so
+ * none of them writes to a database that is already closed. Capped by the
+ * delivery timeout so a hung webhook cannot stall shutdown.
+ */
+export async function stopBackgroundWork(deps: Deps, timeoutMs = 10_000): Promise<void> {
+  deps.sweeper?.stop();
+  const tasks = deps.inflight;
+  if (!tasks || tasks.size === 0) return;
+  await Promise.race([
+    Promise.allSettled([...tasks]),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
 }
 
 /**
@@ -272,6 +307,9 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
       return;
     }
     await readCappedBody(response, RESPONSE_BODY_LIMIT);
+    // The database may have closed while the outbound call was in flight;
+    // do not write to it (F5).
+    if (deps.db.closed) return;
     if (response.status >= 200 && response.status < 300) {
       if (deps.db.transitionInquiry(inquiryId, 'delivering', {
         status: 'pending',
@@ -293,7 +331,9 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
     }
   } catch (err) {
     // Never let a background delivery crash the process; state stays delivering
-    // until the sweeper buries it.
+    // until the sweeper buries it. If the database closed mid-delivery, the
+    // write failure is expected shutdown noise, not a real fault (F5).
+    if (deps.db.closed) return;
     console.error(
       JSON.stringify({
         level: 'error',
@@ -307,6 +347,9 @@ async function deliverInquiry(deps: Deps, inquiryId: string): Promise<void> {
 
 /** Shared terminal transition for a failed delivery: state, metric, audit. */
 function markUndelivered(deps: Deps, inquiryId: string, reason: string): void {
+  // Shutdown may close the database mid-delivery; leave the row for the
+  // startup sweeper instead of writing to a closed handle (F5).
+  if (deps.db.closed) return;
   if (!deps.db.transitionInquiry(inquiryId, 'delivering', { status: 'undelivered', deliveryError: reason })) return;
   deps.metrics?.inc('inquiry_outcome_total', { outcome: 'undelivered' });
   deps.metrics?.inc('inquiry_delivery_failures_total', { reason: deliveryFailureReason(reason) });

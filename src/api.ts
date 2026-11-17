@@ -10,6 +10,7 @@ import { assertWebhookUrl } from './ssrf.js';
 import type { Bot, BotPatch, Inquiry, InquiryStatus } from './types.js';
 import { iso, readJsonObject, readOptionalJsonObject } from './http.js';
 import { decideInquiry, getInquiryFor, listInquiriesFor, openInquiry, startInquirySweeper } from './inquiry.js';
+import type { InquiryLimits } from './inquiry.js';
 import { abandonGrant, listGrantsFor, refreshGrantContact, revokeGrant } from './grants.js';
 import {
   parseBotId,
@@ -26,9 +27,8 @@ const INQUIRY_STATUSES: InquiryStatus[] = ['delivering', 'pending', 'approved', 
 
 export function registerV1Routes(app: Hono, deps: Deps): void {
   // Lazy-expiry sweeper; runs once at startup and then every 60s. It disarms
-  // itself once the database is closed.
-  const sweeper = startInquirySweeper(deps);
-  void sweeper;
+  // itself once the database is closed, and is stopped/drained at shutdown.
+  deps.sweeper = startInquirySweeper(deps);
 
   registerRegistrationRoutes(app, deps);
   registerMeRoutes(app, deps);
@@ -240,6 +240,7 @@ function registerMeRoutes(app: Hono, deps: Deps): void {
 
   app.post('/v1/me/token/rotate', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `token:${bot.id}`, deps.config.mutationRatePerMin);
     const token = newToken();
     const now = deps.now();
     deps.db.updateBot(bot.id, { tokenHash: hashToken(token), tokenSetAt: now }, now);
@@ -256,6 +257,7 @@ function registerMeRoutes(app: Hono, deps: Deps): void {
 
   app.post('/v1/me/token/revoke', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `token:${bot.id}`, deps.config.mutationRatePerMin);
     const now = deps.now();
     deps.db.updateBot(bot.id, { tokenRevokedAt: now }, now);
     deps.db.insertAudit({
@@ -291,10 +293,17 @@ function registerDirectoryRoutes(app: Hono, deps: Deps): void {
 function registerInquiryRoutes(app: Hono, deps: Deps): void {
   app.post('/v1/inquiries', async (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
-    limitKey(deps, `inquiry:${bot.id}`, deps.config.inquiryRatePerMin);
+    // Budgets per design §9.2: a brand-new inquiry consumes the "initiate
+    // inquiry" bucket (10/min), while a controlled refresh through an active
+    // grant consumes the refresh bucket shared with GET /v1/grants/:id/contact
+    // (30/min) — a refresh must not pay the stricter initiation price (F1).
+    const limits: InquiryLimits = {
+      limitNew: () => limitKey(deps, `inquiry:${bot.id}`, deps.config.inquiryRatePerMin),
+      limitRefresh: () => limitKey(deps, `refresh:${bot.id}`, deps.config.mutationRatePerMin),
+    };
     const body = await readJsonObject(c);
     rejectUnknown(body, ['to']);
-    const result = openInquiry(deps, bot, body.to);
+    const result = openInquiry(deps, bot, body.to, limits);
     if (result.kind === 'contact') {
       return c.json({ status: 'approved', grant_id: result.grantId, contact: result.contact });
     }
@@ -306,6 +315,7 @@ function registerInquiryRoutes(app: Hono, deps: Deps): void {
 
   app.get('/v1/inquiries', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `inquiries_read:${bot.id}`, deps.config.defaultRatePerMin);
     const role = c.req.query('role') ?? 'requester';
     if (role !== 'requester' && role !== 'target') {
       throw new HttpError(400, 'invalid_request', 'role must be "requester" or "target"');
@@ -323,6 +333,7 @@ function registerInquiryRoutes(app: Hono, deps: Deps): void {
 
   app.get('/v1/inquiries/:id', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `inquiries_read:${bot.id}`, deps.config.defaultRatePerMin);
     return c.json({ inquiry: presentInquiry(getInquiryFor(deps, bot, c.req.param('id') ?? '')) });
   });
 
@@ -339,6 +350,7 @@ function registerInquiryRoutes(app: Hono, deps: Deps): void {
 function registerGrantRoutes(app: Hono, deps: Deps): void {
   app.get('/v1/grants', (c) => {
     const bot = requireActiveBot(deps, c.req.header('authorization'));
+    limitKey(deps, `grants_read:${bot.id}`, deps.config.defaultRatePerMin);
     const role = c.req.query('role') ?? 'received';
     if (role !== 'given' && role !== 'received') {
       throw new HttpError(400, 'invalid_request', 'role must be "given" or "received"');

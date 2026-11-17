@@ -242,6 +242,33 @@ describe('dedup rules (P0-5⑤)', () => {
     expect(listed.inquiries).toHaveLength(1);
   });
 
+  it('charges controlled refresh to the refresh budget, not the initiation budget (F1)', async () => {
+    // Initiation allows 1/min; refresh allows 4/min. If a refresh wrongly paid
+    // the initiation budget, the second POST /v1/inquiries would be 429.
+    const world = await makeWorld({ config: { inquiryRatePerMin: 1, mutationRatePerMin: 4 } });
+    open.push({ close: async () => { await world.hook.close(); world.deps.db.close(); } });
+    const created = expectStatus(await inquire(world.app, world.alice), 202);
+    await waitForStatus(world.deps, created.inquiry.id as string, 'pending');
+    expectStatus(
+      await api(world.app, `/v1/inquiries/${created.inquiry.id}/decision`, { token: world.bob, body: { decision: 'approve' } }),
+      200,
+    );
+
+    // The first refresh is charged to the refresh bucket; several more still
+    // succeed well past the initiation budget's 1/min.
+    expectStatus(await inquire(world.app, world.alice), 200);
+    expectStatus(await inquire(world.app, world.alice), 200);
+    expectStatus(await inquire(world.app, world.alice), 200);
+    expect(world.hook.hits).toHaveLength(1);
+
+    // The refresh bucket itself is still enforced (shared with the contact
+    // endpoint, design §9.2): 4 used, the 5th within the window is 429.
+    expectStatus(await inquire(world.app, world.alice), 200);
+    const limited = await inquire(world.app, world.alice);
+    expectStatus(limited, 429);
+    expect(limited.json.error.code).toBe('rate_limited');
+  });
+
   it('opens a fresh inquiry after a terminal outcome', async () => {
     const world = await makeWorld({ webhook: { statuses: [500] } });
     open.push({ close: async () => { await world.hook.close(); world.deps.db.close(); } });

@@ -4,6 +4,7 @@ import { createApp } from './app.js';
 import { loadConfig } from './config.js';
 import type { Deps } from './deps.js';
 import { openDatabase } from './db.js';
+import { stopBackgroundWork } from './inquiry.js';
 
 const config = (() => {
   try {
@@ -29,8 +30,13 @@ const server = serve(
 function shutdown(signal: string): void {
   console.log(JSON.stringify({ level: 'info', msg: 'shutdown', signal }));
   server.close(() => {
-    db.close();
-    process.exit(0);
+    void (async () => {
+      // Stop the sweeper and drain in-flight deliveries before closing the
+      // database, so background writes never hit a closed handle (F5).
+      await stopBackgroundWork(deps);
+      db.close();
+      process.exit(0);
+    })();
   });
   setTimeout(() => process.exit(1), 10_000).unref();
 }

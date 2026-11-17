@@ -31,7 +31,9 @@ export function requireBot(deps: Deps, header: string | undefined): Bot {
     throw new HttpError(401, 'unauthorized', 'Bot token required', { 'www-authenticate': 'Bearer' });
   }
   // Last authenticated call, shown as "recent activity" in the admin console.
-  deps.db.touchBot(bot.id, deps.now());
+  // Disabled bots never refresh it: validating a disabled bot's token must not
+  // make it look active (F6) — requireActiveBot re-checks below.
+  if (!bot.disabled) deps.db.touchBot(bot.id, deps.now());
   return bot;
 }
 
