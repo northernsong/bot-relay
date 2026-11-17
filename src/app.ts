@@ -31,7 +31,7 @@ export function createApp(deps: Deps): Hono {
     if (type.includes('text/html')) {
       c.header(
         'Content-Security-Policy',
-        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'none'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
       );
     }
     const path = c.req.path;
