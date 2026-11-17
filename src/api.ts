@@ -160,6 +160,28 @@ function nextSteps(deps: Deps, token: string): Record<string, string> {
     check_own_profile: `curl -s ${base}/v1/me -H '${auth}'`,
     directory_lookup: `curl -s ${base}/v1/directory -H '${auth}'`,
     open_inquiry: `curl -s -X POST ${base}/v1/inquiries -H '${auth}' -H 'content-type: application/json' -d '{"to":"target-bot-id"}'`,
+    get_identity_token: `curl -s -X POST ${base}/v1/identity-token -H '${auth}'`,
+    call_peer_directly: `curl -s -X POST '<peer webhook_url>' -H '<peer webhook_auth_name>: <peer webhook_auth_value>' -H '${IDENTITY_HEADER}: <fresh token from get_identity_token>' -H 'content-type: application/json' -d '{...}'`,
+  };
+}
+
+/**
+ * The header every direct bot-to-bot call must carry. The registry is not on
+ * the call path, so it cannot add it for the caller: without it the receiver
+ * has no proof of who is calling (design §7.1).
+ */
+const IDENTITY_HEADER = 'X-Bot-Relay-Identity';
+
+/** Static how-to for direct calls, returned by GET /v1/me (never contains secrets). */
+function directCallGuide(deps: Deps): Record<string, string | boolean> {
+  const base = deps.config.publicBaseUrl;
+  return {
+    required: true,
+    header: IDENTITY_HEADER,
+    get_token: `POST ${base}/v1/identity-token (Authorization: Bearer <your br_ token>) -> {"token":"eyJ...","expires_at":"..."}`,
+    rule: `Every direct call to a peer webhook must carry ${IDENTITY_HEADER}: <token> next to the peer's own webhook auth header. Fetch a fresh token per call (valid <= 300s).`,
+    receiver_check: `Verify ${IDENTITY_HEADER} against ${base}/.well-known/bot-relay/jwks.json (EdDSA, iss=${base}, exp); reject the call if it is missing or invalid. Inquiries from the registry carry X-Bot-Relay-Signature instead.`,
+    guide: 'docs/AGENT_GUIDE.md §5.2-5.4',
   };
 }
 
@@ -167,7 +189,7 @@ function registerMeRoutes(app: Hono, deps: Deps): void {
   // Disabled bots may inspect their own status (P0-2④ / N4).
   app.get('/v1/me', (c) => {
     const bot = requireBot(deps, c.req.header('authorization'));
-    return c.json({ bot: presentOwnBot(deps, bot) });
+    return c.json({ bot: presentOwnBot(deps, bot), direct_call: directCallGuide(deps) });
   });
 
   app.patch('/v1/me', async (c) => {

@@ -28,7 +28,19 @@ describe('registration onboarding wizard (P1-2)', () => {
 
     const steps = created.next_steps;
     expect(typeof steps).toBe('object');
-    expect(Object.keys(steps).sort()).toEqual(['check_own_profile', 'directory_lookup', 'open_inquiry']);
+    expect(Object.keys(steps).sort()).toEqual([
+      'call_peer_directly',
+      'check_own_profile',
+      'directory_lookup',
+      'get_identity_token',
+      'open_inquiry',
+    ]);
+
+    // Direct calls must carry the identity proof (design §7.1); onboarding says so.
+    expect(steps.get_identity_token).toContain('-X POST https://relay.example.test/v1/identity-token');
+    expect(steps.get_identity_token).toContain(`Authorization: Bearer ${created.token}`);
+    expect(steps.call_peer_directly).toContain('X-Bot-Relay-Identity: ');
+    expect(steps.call_peer_directly).toContain('<peer webhook_auth_name>: <peer webhook_auth_value>');
 
     expect(steps.check_own_profile).toContain('curl -s https://relay.example.test/v1/me');
     expect(steps.check_own_profile).toContain(created.token);
@@ -56,5 +68,20 @@ describe('registration onboarding wizard (P1-2)', () => {
     expect(page.text).toContain('curl -s https://relay.example.test/v1/directory');
     expect(page.text).toContain('-X POST https://relay.example.test/v1/inquiries');
     expect(page.text).toContain('AGENT_GUIDE');
+    expect(page.text).toContain('-X POST https://relay.example.test/v1/identity-token');
+    expect(page.text).toContain('X-Bot-Relay-Identity');
+  });
+
+  it('keeps the agent guide explicit that direct calls carry X-Bot-Relay-Identity', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const guide = await readFile(new URL('../docs/AGENT_GUIDE.md', import.meta.url), 'utf8');
+    const section52 = guide.slice(guide.indexOf('### 5.2'), guide.indexOf('### 5.3'));
+    expect(section52).toContain('必需');
+    expect(section52).toContain("-H 'X-Bot-Relay-Identity: ");
+    expect(section52).toContain('/v1/identity-token');
+    // The end-to-end walkthrough shows the actual direct call, not just a comment.
+    const walkthrough = guide.slice(guide.indexOf('## 8.'), guide.indexOf('## 9.'));
+    expect(walkthrough).toContain('/v1/identity-token');
+    expect(walkthrough).toContain('X-Bot-Relay-Identity: $ID_TOKEN');
   });
 });

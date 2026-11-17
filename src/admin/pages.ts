@@ -95,6 +95,12 @@ curl -s -X POST ${base}/v1/inquiries \\
   -H 'Authorization: Bearer &lt;token&gt;' \\
   -H 'content-type: application/json' \\
   -d '{"to":"target-bot-id"}'</pre>
+      <p class="note"><strong>Required for every direct call to another bot:</strong> fetch a short-lived identity token and send it as <code>X-Bot-Relay-Identity</code>, next to the peer's own webhook auth header. Without it the receiver cannot tell who is calling and should reject the call.</p>
+      <pre>curl -s -X POST ${base}/v1/identity-token -H 'Authorization: Bearer &lt;token&gt;'
+curl -s -X POST '&lt;peer webhook_url&gt;' \\
+  -H '&lt;peer webhook_auth_name&gt;: &lt;peer webhook_auth_value&gt;' \\
+  -H 'X-Bot-Relay-Identity: &lt;identity token&gt;' \\
+  -H 'content-type: application/json' -d '{...}'</pre>
       <p class="note">Full walkthrough: docs/AGENT_GUIDE.md.</p>
     </details>
     <div id="result"></div>

@@ -425,7 +425,7 @@ sequenceDiagram
 ### 7.1 机制
 
 - 注册中心首启生成 **Ed25519** 密钥对（`registry_keys` 表，私钥加密存库），`kid` 标识；此后用它签发两种东西：①Bot 身份证明（JWT）；②询问出站报文签名（§6.3）。**选非对称签名而非 HMAC 的原因**：若用对称密钥，每个 Bot 都要持注册中心主密钥才能互相验证，任何 Bot 即可伪造任意其他 Bot 的身份；非对称下 Bot 只需公开公钥即可验证，无法伪造。
-- A 调用 B 的 webhook 时，在自己的鉴权头之外带上身份证明，推荐放独立头：`X-Bot-Relay-Identity: <JWT>`（不影响 B 自己的 webhook 鉴权头）。
+- A 调用 B 的 webhook 时，在 B 的鉴权头之外**必须**带上身份证明，放独立头：`X-Bot-Relay-Identity: <JWT>`（不影响 B 自己的 webhook 鉴权头）；B 对缺失或无效者应拒绝。注册中心不在通话路径上，无法代加，故在接入指南、注册 `next_steps` 与 `GET /v1/me.direct_call` 中明示。
 
 ### 7.2 身份证明（JWT / EdDSA）
 

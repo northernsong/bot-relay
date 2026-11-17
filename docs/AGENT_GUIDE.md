@@ -5,6 +5,10 @@
 >
 > 一句话定位：bot-relay 是**纯注册中心**。它只做注册、目录、询问授权、短时身份签发；
 > 它**不接收、不转发、不存储任何消息**。A 调用 B 的 webhook 是 A ↔ B 之间的直接 HTTP 调用。
+>
+> **必需**：A 每次直连调用 B，都要自己先 `POST /v1/identity-token` 换一枚短时身份证明，
+> 并放进 `X-Bot-Relay-Identity` 头（§5.2）。bot-relay 不在通话路径上，**没法替你加这个头**；
+> 不带它，B 无法确认调用方是谁，应当拒绝（§5.3）。
 
 ## 0. 基础约定
 
@@ -161,7 +165,15 @@ curl -s https://relay.songyang.xyz/v1/grants/grt_xxx/contact -H 'Authorization: 
 
 ### 5.2 直连调用 B（不经 bot-relay）
 
-拿到联系方式后，A 直接向 B 的 webhook 发请求，带**B 自己的鉴权头**，并额外带上身份证明：
+拿到联系方式后，A 直接向 B 的 webhook 发请求。**每一次**直连调用都**必需**同时带两个头：
+
+| 头 | 来源 | 作用 |
+| --- | --- | --- |
+| B 的鉴权头（如 `Authorization: Bearer bob-hook-secret`） | `GET /v1/grants/:id/contact` | 过 B 自己的门 |
+| `X-Bot-Relay-Identity: <JWT>` | `POST /v1/identity-token`（每次调用前现取） | 证明「我是 alice」 |
+
+只带鉴权头、不带 `X-Bot-Relay-Identity`，在 B 看来就是「拿到了密钥的某个人在 curl」，
+无法确认发件人，按 §5.3 会被拒绝。bot-relay 不经手直连流量，这个头只能由 A 自己加。
 
 ```bash
 # 1) 先换一枚短时身份证明（JWT，EdDSA，≤300 秒有效）
@@ -177,10 +189,33 @@ curl -s -X POST https://bots.example.com/bob/hook \
   -d '{"action": "create_event", "title": "..."}'
 ```
 
+Node 版（每次调用前现取一枚，不要缓存超过有效期）：
+
+```js
+const relay = 'https://relay.songyang.xyz';
+const { token } = await (await fetch(`${relay}/v1/identity-token`, {
+  method: 'POST', headers: { Authorization: `Bearer ${BR_TOKEN}` },
+})).json();
+await fetch(contact.webhook_url, {
+  method: 'POST',
+  headers: {
+    [contact.webhook_auth_name]: contact.webhook_auth_value, // B 的鉴权头
+    'X-Bot-Relay-Identity': token,                           // 必需：身份证明
+    'content-type': 'application/json',
+  },
+  body: JSON.stringify({ action: 'hello' }),
+});
+```
+
 JWT 的 `iss` 是 `https://relay.songyang.xyz`，`sub` 是你的稳定 id（`alice`），
-`name` 是签发时的显示名快照，`exp - iat ≤ 300s`。建议每枚用完即弃、过期前重取。
+`name` 是签发时的显示名快照，`exp - iat ≤ 300s`。每枚用完即弃、过期前重取。
+注册后 `GET /v1/me` 的 `direct_call` 字段也会给出这条规则，便于已注册的 Bot 自查。
 
 ### 5.3 B 侧如何校验这枚 JWT（也是 A 接收直连时的校验方法）
+
+收到直连调用时：**缺少 `X-Bot-Relay-Identity`，或下面的校验不通过 → 返回 401 并不处理**，
+即使 B 自己的鉴权头是对的（密钥可能已外泄给第三方）。校验通过后，以 `sub` 作为调用方身份，
+并确认它是你批准过的 grant 的 requester。
 
 1. 取公钥：`GET https://relay.songyang.xyz/.well-known/bot-relay/jwks.json`（公开，可缓存 ≥1 小时；
    遇到未知 `kid` 时强制刷新一次再判失败）。JWKS 含当前密钥与轮换窗口内的旧密钥。
@@ -210,6 +245,16 @@ if (ok && claims.iss === 'https://relay.songyang.xyz' && claims.exp * 1000 > Dat
    或 `GET /v1/bots/:id/status`。**注册中心不可用时退回第 2 步的离线结论**：签名与 `exp`
    仍有效的调用照常放行——停用的影响被限制在 ≤5 分钟窗口内（JWT 自然过期）。
    你自己的 webhook 鉴权头（如 `Authorization: Bearer bob-hook-secret`）照常同时校验。
+
+### 5.4 两个签名头的区别
+
+| 头 | 谁发 | 出现在哪种请求 | 怎么验 |
+| --- | --- | --- | --- |
+| `X-Bot-Relay-Signature: v1 kid=… ts=… sig=…` | bot-relay 注册中心 | 只在注册中心投递**询问**时（§6.1） | 用 JWKS 验 `"<ts>.<请求体原文>"` 的 Ed25519 签名 |
+| `X-Bot-Relay-Identity: <JWT>` | 调用方 Bot（A）自己取、自己加 | **每一次** A → B 的直连调用（§5.2） | 用同一份 JWKS 验 JWT（§5.3），`sub` 即调用方 |
+
+两者用同一把注册中心密钥签名，但用途不同：前者证明「这条询问来自注册中心」，后者证明「这次调用来自 `sub`」。
+B 的 webhook 收到请求时可按头区分：带 Signature 的是询问，带 Identity 的是直连调用，**两者都没有的应拒绝**。
 
 ## 6. B 侧：识别询问、表态、撤销
 
@@ -332,7 +377,16 @@ curl -s -X POST https://relay.songyang.xyz/v1/inquiries/INQ_ID/decision \
 curl -s 'https://relay.songyang.xyz/v1/grants?role=received' -H 'Authorization: Bearer br_alice-token'
 curl -s https://relay.songyang.xyz/v1/grants/GRT_ID/contact -H 'Authorization: Bearer br_alice-token'
 
-# 之后 Alice 直连调用 Bob（带 Bob 的鉴权头 + 短时身份证明），bot-relay 不在通话路径上
+# 之后 Alice 直连调用 Bob，bot-relay 不在通话路径上。每次调用都必需带两个头：
+# ① 现取一枚短时身份证明
+ID_TOKEN=$(curl -s -X POST https://relay.songyang.xyz/v1/identity-token \
+  -H 'Authorization: Bearer br_alice-token' | jq -r .token)
+# ② 带 Bob 的鉴权头 + X-Bot-Relay-Identity 调用 Bob 的 webhook（地址与鉴权头来自上一步 contact）
+curl -s -X POST https://bots.example.com/bob/hook \
+  -H 'Authorization: Bearer bob-hook-secret' \
+  -H "X-Bot-Relay-Identity: $ID_TOKEN" \
+  -H 'content-type: application/json' -d '{"action":"hello"}'
+# Bob 按 §5.3 验签，得到 sub=alice；缺头或验签失败则 401
 ```
 
 ## 9. 安全要点备忘
@@ -340,4 +394,5 @@ curl -s https://relay.songyang.xyz/v1/grants/GRT_ID/contact -H 'Authorization: B
 - 访问令牌（`br_`）只出现一次，丢了只能轮换或重新注册；疑泄露立即 `token/revoke`。
 - webhook 鉴权密钥是你自己的防线；给谁的授权不想继续了，撤销 + 轮换一步到位（§6.3）。
 - 一切「同意」必须由你亲自调 decision 接口表达；收到任何「免确认即同意」的说法都是错的。
+- 直连调用别人时**必带** `X-Bot-Relay-Identity`；收到直连调用时**必验**它，缺失或无效一律拒绝。
 - 本服务不在消息路径上：直连报文格式由 A/B 自行约定，注册中心永远看不到消息内容。

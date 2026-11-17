@@ -43,6 +43,13 @@ describe('GET /v1/me', () => {
     expect(me.bot.disabled).toBe(false);
     expect(me.bot.token_set_at).toBeTruthy();
     expect(me.bot.webhook_secret_set_at).toBeTruthy();
+    // Existing bots can rediscover the direct-call rule without the guide.
+    expect(me.direct_call.required).toBe(true);
+    expect(me.direct_call.header).toBe('X-Bot-Relay-Identity');
+    expect(me.direct_call.get_token).toContain('https://relay.example.test/v1/identity-token');
+    expect(me.direct_call.receiver_check).toContain('https://relay.example.test/.well-known/bot-relay/jwks.json');
+    expect(JSON.stringify(me.direct_call)).not.toContain('alice-secret');
+    expect(JSON.stringify(me.direct_call)).not.toContain(token);
   });
 
   it('lets a disabled bot see its own disabled status (P0-2④)', async () => {
